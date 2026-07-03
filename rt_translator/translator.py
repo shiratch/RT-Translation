@@ -66,13 +66,14 @@ class NllbCT2Translator(Translator):
 class TranslationWorker(threading.Thread):
     def __init__(self, cfg: Config, translator: Translator,
                  in_queue: queue.Queue, ui_queue: queue.Queue,
-                 stop_event: threading.Event):
+                 stop_event: threading.Event, dictionary=None):
         super().__init__(daemon=True, name="mt")
         self.cfg = cfg
         self.translator = translator
         self.in_queue = in_queue
         self.ui_queue = ui_queue
         self.stop_event = stop_event
+        self.dictionary = dictionary
 
     def run(self):
         while not self.stop_event.is_set():
@@ -100,6 +101,8 @@ class TranslationWorker(threading.Thread):
         except Exception as exc:
             print(f"[mt] 翻訳エラー: {exc}")
             return
+        if self.dictionary is not None:
+            japanese = self.dictionary.apply(japanese)
         if self.cfg.log_latency:
             elapsed = (time.perf_counter() - start) * 1000
             print(f"[mt] {entry['kind']} {elapsed:.0f}ms: {japanese[:60]}")

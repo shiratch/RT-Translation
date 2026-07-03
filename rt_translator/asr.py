@@ -20,13 +20,14 @@ from .config import Config
 
 class StreamingTranscriber(threading.Thread):
     def __init__(self, cfg: Config, audio_queue: queue.Queue, out_queue: queue.Queue,
-                 stop_event: threading.Event, speaker_detector=None):
+                 stop_event: threading.Event, speaker_detector=None, dictionary=None):
         super().__init__(daemon=True, name="asr")
         self.cfg = cfg
         self.audio_queue = audio_queue
         self.out_queue = out_queue
         self.stop_event = stop_event
         self.speaker_detector = speaker_detector
+        self.dictionary = dictionary
         self.model = self._load_model()
         # speech_pad_ms 既定値(400ms)は発話間のポーズを潰して文単位の確定を
         # 妨げるので短くする(セグメント切り出し時に自前で前パディングする)
@@ -141,6 +142,7 @@ class StreamingTranscriber(threading.Thread):
 
     def _transcribe(self, audio: np.ndarray, beam_size: int, kind: str) -> str:
         start = time.perf_counter()
+        hotwords = self.dictionary.hotwords() if self.dictionary else None
         segments, _ = self.model.transcribe(
             audio,
             language=self.cfg.source_language,
@@ -148,8 +150,11 @@ class StreamingTranscriber(threading.Thread):
             temperature=0.0,
             condition_on_previous_text=False,
             without_timestamps=True,
+            hotwords=hotwords,
         )
         text = "".join(seg.text for seg in segments).strip()
+        if self.dictionary is not None:
+            text = self.dictionary.apply(text)
         if self.cfg.log_latency:
             elapsed = (time.perf_counter() - start) * 1000
             audio_sec = len(audio) / TARGET_RATE

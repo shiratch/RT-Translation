@@ -40,14 +40,17 @@ def main():
     ui_queue = queue.Queue()
 
     print("=== RT Translator: モデルをロードしています(初回はダウンロードに数分かかります) ===")
+    from .dictionary import UserDictionary
+    dictionary = UserDictionary(cfg.user_dictionary)
     translator = NllbCT2Translator(cfg)
     speaker_detector = None
     if cfg.speaker_change_detection:
         from .speaker import SpeakerChangeDetector
         speaker_detector = SpeakerChangeDetector(cfg)
     asr = StreamingTranscriber(cfg, audio_queue, text_queue, stop_event,
-                               speaker_detector=speaker_detector)
-    mt = TranslationWorker(cfg, translator, text_queue, ui_queue, stop_event)
+                               speaker_detector=speaker_detector, dictionary=dictionary)
+    mt = TranslationWorker(cfg, translator, text_queue, ui_queue, stop_event,
+                           dictionary=dictionary)
 
     capture = LoopbackCapture(audio_queue)
     capture.start()

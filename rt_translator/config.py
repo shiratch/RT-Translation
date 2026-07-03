@@ -39,6 +39,7 @@ class Config:
 
     # --- その他 ---
     log_latency: bool = True            # 各段の処理時間をコンソールに出す
+    user_dictionary: str = "user_dictionary.txt"  # ユーザー辞書(VoiceText と同書式)
 
 
 def load_config() -> Config:

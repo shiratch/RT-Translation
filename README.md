@@ -70,6 +70,21 @@ python -m venv .venv
 | `final_lines` | 画面に同時表示する最大行数、折り返し込み(既定 5) |
 | `speaker_change_detection` | 話者交代の検出(既定 true)。false で1確定=1行の表示に |
 | `speaker_change_threshold` | 交代判定の閾値(既定 0.45)。誤検出が多ければ下げ、見逃しが多ければ上げる |
+| `user_dictionary` | ユーザー辞書ファイルのパス(後述) |
+
+## ユーザー辞書
+
+`user_dictionary.txt`(または `config.json` の `user_dictionary` で指定した
+ファイル)に 1 行 1 エントリで書く。編集は次の認識から反映(再起動不要):
+
+```
+# コメント行
+間違い=正しい   ← 出力テキストを確実に置換(認識後の英文・翻訳後の和文の両方に適用)
+専門用語        ← Whisper の hotwords として認識をその語に寄せる
+```
+
+辞書ファイルは .gitignore 済みなのでリポジトリにはコミットされない。
+別ツールと同じ辞書を共用したい場合は `config.json` で絶対パスを指定する。
 | `show_source` | 英語原文も字幕上に小さく表示 |
 | `device` | `"cuda"` / `"cpu"`(CUDA 初期化失敗時は自動で CPU フォールバック) |
 
