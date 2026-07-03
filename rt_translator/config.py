@@ -34,7 +34,7 @@ class Config:
     font_size: int = 22
     overlay_alpha: float = 0.85
     overlay_width_ratio: float = 0.6    # 画面幅に対する字幕帯の幅
-    final_lines: int = 5                # 確定字幕を何件(何発話)常に表示するか
+    final_lines: int = 5                # 画面に同時表示する最大行数(折り返し込み)
     show_source: bool = False           # 英語原文も小さく表示するか
 
     # --- その他 ---

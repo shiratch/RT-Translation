@@ -9,6 +9,7 @@
 import queue
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from collections import deque
 
 from .config import Config
@@ -95,10 +96,10 @@ class SubtitleOverlay:
     # ---------- 表示 ----------
 
     def _apply_font(self):
-        font = (self.cfg.font_family, self.font_size)
+        self._font_main = tkfont.Font(family=self.cfg.font_family, size=self.font_size)
         small = (self.cfg.font_family, max(10, int(self.font_size * 0.6)))
-        self.label_final.configure(font=font)
-        self.label_partial.configure(font=font)
+        self.label_final.configure(font=self._font_main)
+        self.label_partial.configure(font=self._font_main)
         self.label_source.configure(font=small)
 
     def _resize_font(self, delta: int):
@@ -118,15 +119,64 @@ class SubtitleOverlay:
         end = len(self.history) - self.view_offset
         return list(self.history)[max(0, end - n):end]
 
+    def _count_lines(self, text: str) -> int:
+        """wraplength での折り返しを含めた表示行数を見積もる。"""
+        total = 0
+        for para in text.split("\n"):
+            width = 0
+            lines = 1
+            for ch in para:
+                w = self._font_main.measure(ch)
+                if width + w > self._wraplength and width > 0:
+                    lines += 1
+                    width = w
+                else:
+                    width += w
+            total += lines
+        return total
+
+    def _tail_fit(self, text: str, max_lines: int) -> str:
+        """max_lines 行に収まるように文頭側を「…」で切り詰める。"""
+        if self._count_lines(text) <= max_lines:
+            return text
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._count_lines("…" + text[mid:]) <= max_lines:
+                hi = mid
+            else:
+                lo = mid + 1
+        return "…" + text[lo:]
+
     def _render(self):
         live = self.view_offset == 0
         marker = "– " if self.cfg.speaker_change_detection else ""
-        self.label_final.configure(
-            text="\n".join(marker + t for t in self._visible_finals()))
-        partial = self._live_partial
-        if partial and self._live_partial_change:
-            partial = marker + partial
-        self.label_partial.configure(text=partial if live else "‹ 過去の字幕 ›")
+
+        # 暫定行(最大2行に切り詰め)を先に確保し、残りを確定字幕に割り当てて
+        # 全体で final_lines 行を超えないようにする
+        if live:
+            partial = self._live_partial
+            if partial and self._live_partial_change:
+                partial = marker + partial
+        else:
+            partial = "‹ 過去の字幕 ›"
+        partial = self._tail_fit(partial, 2) if partial else ""
+        budget = max(1, self.cfg.final_lines - (self._count_lines(partial) if partial else 0))
+
+        chosen = []
+        used = 0
+        for turn in reversed(self._visible_finals()):
+            text = marker + turn
+            lines = self._count_lines(text)
+            if used + lines > budget:
+                if not chosen:  # 最新ターン単体で収まらない場合は頭を切り詰める
+                    chosen.append(self._tail_fit(text, budget))
+                break
+            chosen.append(text)
+            used += lines
+
+        self.label_final.configure(text="\n".join(reversed(chosen)))
+        self.label_partial.configure(text=partial)
         if self.cfg.show_source:
             self.label_source.configure(text=self._live_source if live else "")
         self.root.update_idletasks()
