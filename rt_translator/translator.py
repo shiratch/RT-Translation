@@ -95,6 +95,11 @@ class TranslationWorker(threading.Thread):
                 self._translate_one(entry)
 
     def _translate_one(self, entry: dict):
+        if not entry["text"]:
+            # 空テキスト(幻覚破棄によるクリア指示)はそのまま UI へ
+            self.ui_queue.put({"kind": entry["kind"], "en": "", "ja": "",
+                               "speaker_change": False})
+            return
         start = time.perf_counter()
         try:
             japanese = self.translator.translate(entry["text"])

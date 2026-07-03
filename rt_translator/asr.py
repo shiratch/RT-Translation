@@ -18,6 +18,36 @@ from .audio_capture import TARGET_RATE
 from .config import Config
 
 
+def collapse_repeats(text: str) -> str:
+    """Whisper の繰り返し幻覚(同じ語句の連呼)を除去する。
+
+    1〜4 語の同一 n-gram が 3 回以上連続していたら 1 回に畳む。
+    畳んだ結果、元テキストの半分以上が繰り返しだった場合は
+    幻覚(音楽・拍手など非発話区間)とみなして全体を破棄する。
+    """
+    tokens = text.split()
+    out = []
+    removed = 0
+    i = 0
+    while i < len(tokens):
+        for n in (4, 3, 2, 1):
+            k = 1
+            while (i + (k + 1) * n <= len(tokens)
+                   and tokens[i:i + n] == tokens[i + k * n:i + (k + 1) * n]):
+                k += 1
+            if k >= 3:
+                out.extend(tokens[i:i + n])
+                removed += (k - 1) * n
+                i += k * n
+                break
+        else:
+            out.append(tokens[i])
+            i += 1
+    if removed > len(tokens) // 2:
+        return ""
+    return " ".join(out) if removed else text
+
+
 class StreamingTranscriber(threading.Thread):
     def __init__(self, cfg: Config, audio_queue: queue.Queue, out_queue: queue.Queue,
                  stop_event: threading.Event, speaker_detector=None, dictionary=None):
@@ -115,13 +145,14 @@ class StreamingTranscriber(threading.Thread):
                 last_partial_at = 0.0
                 if (split_end - speech_start) / TARGET_RATE < cfg.min_speech:
                     continue
-                speaker_change = False
-                if self.speaker_detector is not None:
-                    speaker_change = self.speaker_detector.is_change(segment)
                 text = self._transcribe(segment, beam_size=cfg.final_beam_size, kind="final")
-                if text:
-                    self.out_queue.put({"kind": "final", "text": text,
-                                        "speaker_change": speaker_change})
+                speaker_change = False
+                # 幻覚破棄したセグメント(音楽等)では声紋の基準を更新しない
+                if text and self.speaker_detector is not None:
+                    speaker_change = self.speaker_detector.is_change(segment)
+                # text が空(幻覚破棄)でも流し、画面のグレー字幕をクリアさせる
+                self.out_queue.put({"kind": "final", "text": text,
+                                    "speaker_change": speaker_change})
             elif time.monotonic() - last_partial_at >= cfg.partial_interval:
                 speech_end = speech[-1]["end"]
                 if (speech_end - speech_start) / TARGET_RATE < cfg.min_speech:
@@ -136,9 +167,8 @@ class StreamingTranscriber(threading.Thread):
                 if self.speaker_detector is not None:
                     speaker_change = self.speaker_detector.peek_change(segment)
                 text = self._transcribe(segment, beam_size=cfg.partial_beam_size, kind="partial")
-                if text:
-                    self.out_queue.put({"kind": "partial", "text": text,
-                                        "speaker_change": speaker_change})
+                self.out_queue.put({"kind": "partial", "text": text,
+                                    "speaker_change": speaker_change})
 
     def _transcribe(self, audio: np.ndarray, beam_size: int, kind: str) -> str:
         start = time.perf_counter()
@@ -147,12 +177,17 @@ class StreamingTranscriber(threading.Thread):
             audio,
             language=self.cfg.source_language,
             beam_size=beam_size,
-            temperature=0.0,
+            # 圧縮率チェックに失敗したセグメントは温度を上げて再試行させる
+            temperature=[0.0, 0.2, 0.4],
             condition_on_previous_text=False,
             without_timestamps=True,
             hotwords=hotwords,
         )
         text = "".join(seg.text for seg in segments).strip()
+        cleaned = collapse_repeats(text)
+        if cleaned != text and self.cfg.log_latency:
+            print(f"[asr] 繰り返し幻覚を{'除去' if not cleaned else '圧縮'}: {text[:60]}")
+        text = cleaned
         if self.dictionary is not None:
             text = self.dictionary.apply(text)
         if self.cfg.log_latency:

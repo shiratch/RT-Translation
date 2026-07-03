@@ -250,6 +250,8 @@ class SubtitleOverlay:
     def _append_final(self, item: dict):
         """確定訳を履歴に追加。話者が同じ間は直前のターンに連結し、
         話者交代(または検出無効・長すぎ)で新しいターン(行)を始める。"""
+        if not item["ja"]:  # 幻覚破棄によるクリア指示
+            return
         same_speaker = (self.cfg.speaker_change_detection
                         and not item.get("speaker_change", False)
                         and len(self.history) > 0
