@@ -60,7 +60,7 @@ class NllbCT2Translator(Translator):
                 output = output[1:]
             ids = self.tokenizer.convert_tokens_to_ids(output)
             translated.append(self.tokenizer.decode(ids, skip_special_tokens=True).strip())
-        return "".join(translated)
+        return " ".join(translated)
 
 
 class TranslationWorker(threading.Thread):
@@ -74,6 +74,9 @@ class TranslationWorker(threading.Thread):
         self.ui_queue = ui_queue
         self.stop_event = stop_event
         self.dictionary = dictionary
+        # 暫定字幕のチラつき防止: 完結した文の訳をセグメント内でキャッシュし、
+        # 表示済みの訳が更新のたびに書き換わらないようにする
+        self._sentence_cache: dict[str, str] = {}
 
     def run(self):
         while not self.stop_event.is_set():
@@ -102,7 +105,11 @@ class TranslationWorker(threading.Thread):
             return
         start = time.perf_counter()
         try:
-            japanese = self.translator.translate(entry["text"])
+            if entry["kind"] == "partial":
+                japanese = self._translate_partial(entry["text"])
+            else:
+                japanese = self.translator.translate(entry["text"])
+                self._sentence_cache.clear()  # セグメント確定でキャッシュを捨てる
         except Exception as exc:
             print(f"[mt] 翻訳エラー: {exc}")
             return
@@ -113,3 +120,22 @@ class TranslationWorker(threading.Thread):
             print(f"[mt] {entry['kind']} {elapsed:.0f}ms: {japanese[:60]}")
         self.ui_queue.put({"kind": entry["kind"], "en": entry["text"], "ja": japanese,
                            "speaker_change": entry.get("speaker_change", False)})
+
+    def _translate_partial(self, text: str) -> str:
+        """完結した文はキャッシュした訳を使い回し、末尾の言いかけの文だけを
+        訳し直す。グレー字幕の頭部分が更新のたびに変わるのを防ぐ。"""
+        sentences = [s.strip() for s in _SENTENCE_SPLIT.split(text) if s.strip()]
+        if not sentences:
+            return ""
+        parts = []
+        for i, sentence in enumerate(sentences):
+            complete = i < len(sentences) - 1 or sentence.endswith((".", "!", "?"))
+            if complete:
+                if sentence not in self._sentence_cache:
+                    if len(self._sentence_cache) > 100:
+                        self._sentence_cache.clear()
+                    self._sentence_cache[sentence] = self.translator.translate(sentence)
+                parts.append(self._sentence_cache[sentence])
+            else:
+                parts.append(self.translator.translate(sentence))
+        return " ".join(p for p in parts if p)
