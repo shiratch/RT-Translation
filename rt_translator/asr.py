@@ -51,6 +51,7 @@ class StreamingTranscriber(threading.Thread):
         last_partial_at = 0.0
         last_partial_len = 0
         last_audio_at = time.monotonic()
+        last_speaker_check = 0.0
         silence_block = np.zeros(TARGET_RATE // 10, dtype=np.float32)
 
         while not self.stop_event.is_set():
@@ -83,12 +84,23 @@ class StreamingTranscriber(threading.Thread):
             silence_samples = int(cfg.silence_finalize * TARGET_RATE)
             speech_start = speech[0]["start"]
 
-            # 確定位置を探す: 発話間のポーズ / 末尾の無音 / 最大発話長の超過
+            # 確定位置を探す: 発話間のポーズ / 話者交代 / 末尾の無音 / 最大発話長の超過
             split_end = None
+            check_speaker = (self.speaker_detector is not None
+                             and time.monotonic() - last_speaker_check >= 0.5)
             for prev, nxt in zip(speech, speech[1:]):
                 if nxt["start"] - prev["end"] >= silence_samples:
                     split_end = prev["end"]
                     break
+                # ポーズが短くても声紋が変わっていれば話者交代として確定する
+                # (埋め込み計算は CPU ~50ms×2 なのでサイクルを 0.5 秒に 1 回に間引く)
+                if check_speaker:
+                    last_speaker_check = time.monotonic()
+                    before = buffer[speech_start:prev["end"]]
+                    after = buffer[nxt["start"]:speech[-1]["end"]]
+                    if self.speaker_detector.is_boundary(before, after):
+                        split_end = prev["end"]
+                        break
             if split_end is None:
                 trailing_silence = len(buffer) - speech[-1]["end"]
                 speech_sec = (speech[-1]["end"] - speech_start) / TARGET_RATE

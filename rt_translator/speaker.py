@@ -49,6 +49,17 @@ class SpeakerChangeDetector:
         emb = np.array(self._extractor.compute(stream), dtype=np.float32)
         return emb / (np.linalg.norm(emb) + 1e-8)
 
+    def is_boundary(self, before: np.ndarray, after: np.ndarray) -> bool:
+        """発話中の小さなポーズの前後で話者が変わったかを判定する。
+        (無音を待たずに文を確定するための判定。状態は更新しない)"""
+        if len(before) < self._min_samples or len(after) < self._min_samples:
+            return False
+        similarity = float(np.dot(self._embed(before), self._embed(after)))
+        changed = similarity < self._threshold
+        if changed and self._log:
+            print(f"[spk] 発話中に話者交代を検出 (similarity={similarity:.2f})")
+        return changed
+
     def peek_change(self, audio: np.ndarray) -> bool:
         """暫定(認識途中)セグメント用: 直前の確定話者と比較するだけで、
         基準となる話者ベクトルは更新しない。"""
