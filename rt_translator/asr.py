@@ -119,9 +119,13 @@ class StreamingTranscriber(threading.Thread):
                 last_partial_at = time.monotonic()
                 last_partial_len = speech_end
                 segment = buffer[max(0, speech_start - TARGET_RATE // 4):]
+                speaker_change = False
+                if self.speaker_detector is not None:
+                    speaker_change = self.speaker_detector.peek_change(segment)
                 text = self._transcribe(segment, beam_size=cfg.partial_beam_size, kind="partial")
                 if text:
-                    self.out_queue.put({"kind": "partial", "text": text})
+                    self.out_queue.put({"kind": "partial", "text": text,
+                                        "speaker_change": speaker_change})
 
     def _transcribe(self, audio: np.ndarray, beam_size: int, kind: str) -> str:
         start = time.perf_counter()

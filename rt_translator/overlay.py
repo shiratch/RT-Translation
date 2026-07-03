@@ -30,6 +30,7 @@ class SubtitleOverlay:
         self.history: deque[str] = deque(maxlen=MAX_HISTORY)
         self.view_offset = 0        # 0=最新に追従 / n=末尾から n 件遡った位置
         self._live_partial = ""     # 遡り中も裏で保持し、最新に戻ったら表示
+        self._live_partial_change = False  # 暫定字幕が新しい話者かどうか
         self._live_source = ""
 
         self.root = tk.Tk()
@@ -122,7 +123,10 @@ class SubtitleOverlay:
         marker = "– " if self.cfg.speaker_change_detection else ""
         self.label_final.configure(
             text="\n".join(marker + t for t in self._visible_finals()))
-        self.label_partial.configure(text=self._live_partial if live else "‹ 過去の字幕 ›")
+        partial = self._live_partial
+        if partial and self._live_partial_change:
+            partial = marker + partial
+        self.label_partial.configure(text=partial if live else "‹ 過去の字幕 ›")
         if self.cfg.show_source:
             self.label_source.configure(text=self._live_source if live else "")
         self.root.update_idletasks()
@@ -224,9 +228,11 @@ class SubtitleOverlay:
             if item["kind"] == "final":
                 self._append_final(item)
                 self._live_partial = ""
+                self._live_partial_change = False
                 self._live_source = item["en"]
             else:
                 self._live_partial = item["ja"]
+                self._live_partial_change = item.get("speaker_change", False)
                 self._live_source = item["en"]
         if updated:
             self._render()

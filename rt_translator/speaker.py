@@ -49,6 +49,14 @@ class SpeakerChangeDetector:
         emb = np.array(self._extractor.compute(stream), dtype=np.float32)
         return emb / (np.linalg.norm(emb) + 1e-8)
 
+    def peek_change(self, audio: np.ndarray) -> bool:
+        """暫定(認識途中)セグメント用: 直前の確定話者と比較するだけで、
+        基準となる話者ベクトルは更新しない。"""
+        if self._prev is None or len(audio) < self._min_samples:
+            return False
+        emb = self._embed(audio)
+        return float(np.dot(self._prev, emb)) < self._threshold
+
     def is_change(self, audio: np.ndarray) -> bool:
         """確定セグメントの音声を受け取り、直前と話者が変わったかを返す。"""
         if len(audio) < self._min_samples:
