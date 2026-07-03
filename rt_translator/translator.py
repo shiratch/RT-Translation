@@ -103,4 +103,5 @@ class TranslationWorker(threading.Thread):
         if self.cfg.log_latency:
             elapsed = (time.perf_counter() - start) * 1000
             print(f"[mt] {entry['kind']} {elapsed:.0f}ms: {japanese[:60]}")
-        self.ui_queue.put({"kind": entry["kind"], "en": entry["text"], "ja": japanese})
+        self.ui_queue.put({"kind": entry["kind"], "en": entry["text"], "ja": japanese,
+                           "speaker_change": entry.get("speaker_change", False)})

@@ -7,3 +7,4 @@ sentencepiece
 huggingface_hub
 nvidia-cublas-cu12
 nvidia-cudnn-cu12>=9
+sherpa-onnx>=1.12

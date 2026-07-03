@@ -20,12 +20,13 @@ from .config import Config
 
 class StreamingTranscriber(threading.Thread):
     def __init__(self, cfg: Config, audio_queue: queue.Queue, out_queue: queue.Queue,
-                 stop_event: threading.Event):
+                 stop_event: threading.Event, speaker_detector=None):
         super().__init__(daemon=True, name="asr")
         self.cfg = cfg
         self.audio_queue = audio_queue
         self.out_queue = out_queue
         self.stop_event = stop_event
+        self.speaker_detector = speaker_detector
         self.model = self._load_model()
         # speech_pad_ms 既定値(400ms)は発話間のポーズを潰して文単位の確定を
         # 妨げるので短くする(セグメント切り出し時に自前で前パディングする)
@@ -101,9 +102,13 @@ class StreamingTranscriber(threading.Thread):
                 last_partial_at = 0.0
                 if (split_end - speech_start) / TARGET_RATE < cfg.min_speech:
                     continue
+                speaker_change = False
+                if self.speaker_detector is not None:
+                    speaker_change = self.speaker_detector.is_change(segment)
                 text = self._transcribe(segment, beam_size=cfg.final_beam_size, kind="final")
                 if text:
-                    self.out_queue.put({"kind": "final", "text": text})
+                    self.out_queue.put({"kind": "final", "text": text,
+                                        "speaker_change": speaker_change})
             elif time.monotonic() - last_partial_at >= cfg.partial_interval:
                 speech_end = speech[-1]["end"]
                 if (speech_end - speech_start) / TARGET_RATE < cfg.min_speech:

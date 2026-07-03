@@ -15,6 +15,7 @@ from .config import Config
 
 BG = "#101010"
 MAX_HISTORY = 200
+MAX_TURN_CHARS = 120   # 同一話者でもこの文字数を超えたら新しい行にする
 SCROLLBAR_W = 12
 THUMB_MIN_H = 24
 
@@ -25,7 +26,8 @@ class SubtitleOverlay:
         self.ui_queue = ui_queue
         self.stop_event = stop_event
 
-        self.history: deque[str] = deque(maxlen=MAX_HISTORY)  # 確定訳の全履歴
+        # 確定訳の履歴。1 要素 = 1 話者ターン(同一話者の連続発話は連結される)
+        self.history: deque[str] = deque(maxlen=MAX_HISTORY)
         self.view_offset = 0        # 0=最新に追従 / n=末尾から n 件遡った位置
         self._live_partial = ""     # 遡り中も裏で保持し、最新に戻ったら表示
         self._live_source = ""
@@ -117,7 +119,9 @@ class SubtitleOverlay:
 
     def _render(self):
         live = self.view_offset == 0
-        self.label_final.configure(text="\n".join(self._visible_finals()))
+        marker = "– " if self.cfg.speaker_change_detection else ""
+        self.label_final.configure(
+            text="\n".join(marker + t for t in self._visible_finals()))
         self.label_partial.configure(text=self._live_partial if live else "‹ 過去の字幕 ›")
         if self.cfg.show_source:
             self.label_source.configure(text=self._live_source if live else "")
@@ -189,6 +193,23 @@ class SubtitleOverlay:
 
     # ---------- キューからの更新 ----------
 
+    def _append_final(self, item: dict):
+        """確定訳を履歴に追加。話者が同じ間は直前のターンに連結し、
+        話者交代(または検出無効・長すぎ)で新しいターン(行)を始める。"""
+        same_speaker = (self.cfg.speaker_change_detection
+                        and not item.get("speaker_change", False)
+                        and len(self.history) > 0
+                        and len(self.history[-1]) < MAX_TURN_CHARS)
+        if same_speaker:
+            self.history[-1] = self.history[-1] + item["ja"]
+            return
+        at_capacity = len(self.history) == MAX_HISTORY
+        self.history.append(item["ja"])
+        # 遡り中は表示位置を固定する(deque が満杯のときは全体が
+        # 1 つずれるので補正不要)
+        if self.view_offset > 0 and not at_capacity:
+            self.view_offset = min(self._max_offset(), self.view_offset + 1)
+
     def _poll(self):
         if self.stop_event.is_set():
             self.root.destroy()
@@ -201,14 +222,9 @@ class SubtitleOverlay:
                 break
             updated = True
             if item["kind"] == "final":
-                at_capacity = len(self.history) == MAX_HISTORY
-                self.history.append(item["ja"])
+                self._append_final(item)
                 self._live_partial = ""
                 self._live_source = item["en"]
-                # 遡り中は表示位置を固定する(deque が満杯のときは全体が
-                # 1 つずれるので補正不要)
-                if self.view_offset > 0 and not at_capacity:
-                    self.view_offset = min(self._max_offset(), self.view_offset + 1)
             else:
                 self._live_partial = item["ja"]
                 self._live_source = item["en"]

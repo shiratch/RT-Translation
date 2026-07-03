@@ -24,6 +24,11 @@ class Config:
     target_lang: str = "jpn_Jpan"
     source_lang_nllb: str = "eng_Latn"
 
+    # --- 話者交代検出 ---
+    speaker_change_detection: bool = True
+    speaker_change_threshold: float = 0.45  # コサイン類似度がこれ未満なら話者交代
+    speaker_min_speech: float = 1.0         # これ未満の発話は判定せず同一話者扱い [秒]
+
     # --- オーバーレイ表示 ---
     font_family: str = "Yu Gothic UI"
     font_size: int = 22
