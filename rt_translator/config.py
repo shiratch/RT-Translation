@@ -31,10 +31,10 @@ class Config:
 
     # --- オーバーレイ表示 ---
     font_family: str = "Yu Gothic UI"
-    font_size: int = 22
+    font_size: int = 18
     overlay_alpha: float = 0.85
     overlay_width_ratio: float = 0.6    # 画面幅に対する字幕帯の幅
-    final_lines: int = 5                # 画面に同時表示する最大行数(折り返し込み)
+    final_lines: int = 7                # 画面に同時表示する最大行数(折り返し込み)
     show_source: bool = False           # 英語原文も小さく表示するか
 
     # --- その他 ---

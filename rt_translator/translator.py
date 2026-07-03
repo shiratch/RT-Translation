@@ -77,6 +77,7 @@ class TranslationWorker(threading.Thread):
         # 暫定字幕のチラつき防止: 完結した文の訳をセグメント内でキャッシュし、
         # 表示済みの訳が更新のたびに書き換わらないようにする
         self._sentence_cache: dict[str, str] = {}
+        self._last_partial_result: dict | None = None
 
     def run(self):
         while not self.stop_event.is_set():
@@ -99,9 +100,14 @@ class TranslationWorker(threading.Thread):
 
     def _translate_one(self, entry: dict):
         if not entry["text"]:
+            if entry["kind"] == "final" and self._emit_partial_fallback("final text empty"):
+                return
             # 空テキスト(幻覚破棄によるクリア指示)はそのまま UI へ
             self.ui_queue.put({"kind": entry["kind"], "en": "", "ja": "",
                                "speaker_change": False})
+            if entry["kind"] == "final":
+                self._last_partial_result = None
+                self._sentence_cache.clear()
             return
         start = time.perf_counter()
         try:
@@ -112,14 +118,37 @@ class TranslationWorker(threading.Thread):
                 self._sentence_cache.clear()  # セグメント確定でキャッシュを捨てる
         except Exception as exc:
             print(f"[mt] 翻訳エラー: {exc}")
+            if entry["kind"] == "final":
+                self._emit_partial_fallback("final translate error")
             return
         if self.dictionary is not None:
             japanese = self.dictionary.apply(japanese)
+        if entry["kind"] == "final" and not japanese:
+            if self._emit_partial_fallback("final translation empty"):
+                return
         if self.cfg.log_latency:
             elapsed = (time.perf_counter() - start) * 1000
             print(f"[mt] {entry['kind']} {elapsed:.0f}ms: {japanese[:60]}")
-        self.ui_queue.put({"kind": entry["kind"], "en": entry["text"], "ja": japanese,
-                           "speaker_change": entry.get("speaker_change", False)})
+        result = {"kind": entry["kind"], "en": entry["text"], "ja": japanese,
+                  "speaker_change": entry.get("speaker_change", False)}
+        if entry["kind"] == "partial" and japanese:
+            self._last_partial_result = result
+        elif entry["kind"] == "final":
+            self._last_partial_result = None
+        self.ui_queue.put(result)
+
+    def _emit_partial_fallback(self, reason: str) -> bool:
+        """確定結果が空/失敗したとき、直近の暫定翻訳を確定として残す。"""
+        if not self._last_partial_result:
+            return False
+        cached = dict(self._last_partial_result)
+        cached["kind"] = "final"
+        self.ui_queue.put(cached)
+        self._last_partial_result = None
+        self._sentence_cache.clear()
+        if self.cfg.log_latency:
+            print(f"[mt] {reason}; 直近の partial を final として採用: {cached['ja'][:60]}")
+        return True
 
     def _translate_partial(self, text: str) -> str:
         """完結した文はキャッシュした訳を使い回し、末尾の言いかけの文だけを

@@ -81,6 +81,7 @@ class StreamingTranscriber(threading.Thread):
         buffer = np.zeros(0, dtype=np.float32)
         last_partial_at = 0.0
         last_partial_len = 0
+        last_partial_text = ""
         last_audio_at = time.monotonic()
         last_speaker_check = 0.0
         silence_block = np.zeros(TARGET_RATE // 10, dtype=np.float32)
@@ -144,8 +145,13 @@ class StreamingTranscriber(threading.Thread):
                 last_partial_len = 0
                 last_partial_at = 0.0
                 if (split_end - speech_start) / TARGET_RATE < cfg.min_speech:
+                    last_partial_text = ""
                     continue
                 text = self._transcribe(segment, beam_size=cfg.final_beam_size, kind="final")
+                if not text and last_partial_text:
+                    text = last_partial_text
+                    if cfg.log_latency:
+                        print(f"[asr] final が空のため直近の partial を採用: {text[:60]}")
                 speaker_change = False
                 # 幻覚破棄したセグメント(音楽等)では声紋の基準を更新しない
                 if text and self.speaker_detector is not None:
@@ -153,6 +159,7 @@ class StreamingTranscriber(threading.Thread):
                 # text が空(幻覚破棄)でも流し、画面のグレー字幕をクリアさせる
                 self.out_queue.put({"kind": "final", "text": text,
                                     "speaker_change": speaker_change})
+                last_partial_text = ""
             elif time.monotonic() - last_partial_at >= cfg.partial_interval:
                 speech_end = speech[-1]["end"]
                 if (speech_end - speech_start) / TARGET_RATE < cfg.min_speech:
@@ -167,6 +174,8 @@ class StreamingTranscriber(threading.Thread):
                 if self.speaker_detector is not None:
                     speaker_change = self.speaker_detector.peek_change(segment)
                 text = self._transcribe(segment, beam_size=cfg.partial_beam_size, kind="partial")
+                if text:
+                    last_partial_text = text
                 self.out_queue.put({"kind": "partial", "text": text,
                                     "speaker_change": speaker_change})
 
