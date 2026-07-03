@@ -1,0 +1,9 @@
+faster-whisper>=1.1.0
+ctranslate2>=4.5.0
+PyAudioWPatch>=0.2.12.7
+numpy
+transformers>=4.44
+sentencepiece
+huggingface_hub
+nvidia-cublas-cu12
+nvidia-cudnn-cu12>=9
