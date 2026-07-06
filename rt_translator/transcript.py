@@ -3,6 +3,7 @@ from datetime import datetime
 from pathlib import Path
 import queue
 import threading
+import time
 
 from .config import Config
 
@@ -36,7 +37,7 @@ class TranscriptWriter:
         print(f"[transcript] 保存先: {self.path}")
 
     def write_final(self, en: str, ja: str, source_label: str = "",
-                    transcript_format: str = ""):
+                    transcript_format: str = "", ja_label: str = ""):
         if not self.enabled or self.path is None:
             return
 
@@ -61,9 +62,13 @@ class TranscriptWriter:
             if header:
                 lines.append(header)
             if en:
-                lines.append(f"EN: {en}")
+                lines.append(f"{self.cfg.transcript_english_label}: {en}")
             if ja:
-                lines.append(f"JA: {ja}")
+                label = ja_label or (
+                    self.cfg.transcript_translation_label if en
+                    else self.cfg.transcript_japanese_label
+                )
+                lines.append(f"{label}: {ja}")
             lines.append("")
 
         self._append(lines)
@@ -104,7 +109,15 @@ class TranscriptOnlyWorker(threading.Thread):
         self.source_label = source_label
 
     def run(self):
-        while not self.stop_event.is_set():
+        idle_since = 0.0
+        while True:
+            if self.stop_event.is_set() and self.in_queue.empty():
+                if not idle_since:
+                    idle_since = time.monotonic()
+                elif time.monotonic() - idle_since >= self.cfg.shutdown_drain_seconds:
+                    break
+            else:
+                idle_since = 0.0
             try:
                 item = self.in_queue.get(timeout=0.1)
             except queue.Empty:

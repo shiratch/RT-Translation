@@ -10,10 +10,15 @@ import threading
 import time
 
 from .config import Config
-from .text_cleanup import cleanup_translation_text
+from .text_cleanup import (cleanup_translation_text, normalize_japanese_punctuation,
+                           repair_translation_numbers)
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 _SENTENCE_END = re.compile(r'[.!?。！？]["\')\]]*\s*$')
+_FORMULA_FRAGMENT_RE = re.compile(
+    r"\b(formula|study|practice|plus|times|time|equals?|fluency)\b",
+    re.IGNORECASE,
+)
 _JAPANESE_SOURCE_LANGS = {"ja", "jp", "japanese", "jpn", "jpn_jpan", "ja_jp"}
 MAX_SENTENCE_CACHE = 100
 
@@ -26,7 +31,10 @@ class Translator:
     def translate(self, text: str, beam_size: int = 1,
                   length_penalty: float = 1.0,
                   repetition_penalty: float = 1.0,
-                  no_repeat_ngram_size: int = 0) -> str:
+                  no_repeat_ngram_size: int = 0,
+                  max_decoding_length: int = 256,
+                  max_unit_chars: int = 180,
+                  split_sentences: bool = True) -> str:
         raise NotImplementedError
 
 
@@ -56,15 +64,19 @@ class NllbCT2Translator(Translator):
     def translate(self, text: str, beam_size: int = 1,
                   length_penalty: float = 1.0,
                   repetition_penalty: float = 1.0,
-                  no_repeat_ngram_size: int = 0) -> str:
-        # NLLB は長い複文で訳が劣化するため、文単位に分割して一括バッチ翻訳する
-        sentences = [s for s in _SENTENCE_SPLIT.split(text) if s.strip()] or [text]
-        batch = [self.tokenizer.convert_ids_to_tokens(self.tokenizer.encode(s))
-                 for s in sentences]
+                  no_repeat_ngram_size: int = 0,
+                  max_decoding_length: int = 256,
+                  max_unit_chars: int = 180,
+                  split_sentences: bool = True) -> str:
+        # 長文は文単位に分割するが、確定字幕の短〜中程度の段落は文脈を
+        # 保ったまま一括入力する方が、断片訳になりにくい。
+        units = self._translation_units(text, split_sentences, max_unit_chars)
+        batch = [self.tokenizer.convert_ids_to_tokens(self.tokenizer.encode(unit))
+                 for unit in units]
         translate_kwargs = {
             "target_prefix": [[self.target_lang]] * len(batch),
             "beam_size": beam_size,
-            "max_decoding_length": 256,
+            "max_decoding_length": max_decoding_length,
             "length_penalty": length_penalty,
             "repetition_penalty": repetition_penalty,
         }
@@ -85,6 +97,42 @@ class NllbCT2Translator(Translator):
             ids = self.tokenizer.convert_tokens_to_ids(output)
             translated.append(self.tokenizer.decode(ids, skip_special_tokens=True).strip())
         return " ".join(translated)
+
+    def _translation_units(self, text: str, split_sentences: bool,
+                           max_unit_chars: int) -> list[str]:
+        if not split_sentences:
+            return [text.strip()] if text.strip() else [text]
+        units = [s for s in _SENTENCE_SPLIT.split(text) if s.strip()] or [text]
+        split_units = []
+        for unit in units:
+            split_units.extend(self._split_long_unit(unit, max_unit_chars))
+        return split_units
+
+    def _split_long_unit(self, text: str, max_chars: int) -> list[str]:
+        if max_chars <= 0 or len(text) <= max_chars:
+            return [text]
+        separators = (
+            ", ", "; ", ": ", " and ", " but ", " which ", " because ",
+            " so ", " at the moment ", " to ", " from ",
+        )
+        chunks = []
+        rest = text.strip()
+        min_cut = max(40, max_chars // 3)
+        while len(rest) > max_chars:
+            cut = 0
+            for sep in separators:
+                pos = rest.rfind(sep, min_cut, max_chars + 1)
+                if pos > cut:
+                    cut = pos + len(sep)
+            if cut <= 0:
+                cut = rest.rfind(" ", min_cut, max_chars + 1)
+            if cut <= 0:
+                cut = max_chars
+            chunks.append(rest[:cut].strip())
+            rest = rest[cut:].strip()
+        if rest:
+            chunks.append(rest)
+        return chunks
 
 
 class TranslationWorker(threading.Thread):
@@ -107,7 +155,15 @@ class TranslationWorker(threading.Thread):
         self._final_buffer_updated_at = 0.0
 
     def run(self):
-        while not self.stop_event.is_set():
+        idle_since = 0.0
+        while True:
+            if self.stop_event.is_set() and self.in_queue.empty():
+                if not idle_since:
+                    idle_since = time.monotonic()
+                elif time.monotonic() - idle_since >= self.cfg.shutdown_drain_seconds:
+                    break
+            else:
+                idle_since = 0.0
             try:
                 item = self.in_queue.get(timeout=0.1)
             except queue.Empty:
@@ -129,7 +185,7 @@ class TranslationWorker(threading.Thread):
                 self._translate_one(partials[-1])
         self._flush_final_buffer("stop")
 
-    def _handle_final(self, entry: dict):
+    def _handle_final(self, entry: dict, allow_split: bool = True):
         if (self._passthrough_source
                 or not self.cfg.translation_buffer_final_fragments):
             self._flush_final_buffer("immediate final")
@@ -143,6 +199,21 @@ class TranslationWorker(threading.Thread):
 
         if entry.get("speaker_change", False) and self._final_buffer:
             self._flush_final_buffer("speaker change")
+
+        if allow_split:
+            split = self._split_deferred_fragment(entry["text"])
+            if split is not None:
+                head, tail = split
+                head_entry = dict(entry)
+                head_entry["text"] = head
+                self._handle_final(head_entry, allow_split=False)
+
+                tail_entry = dict(entry)
+                tail_entry["text"] = tail
+                tail_entry["defer_flush"] = True
+                self._handle_final(tail_entry, allow_split=False)
+                return
+
         self._final_buffer.append(entry)
         self._final_buffer_updated_at = time.monotonic()
         if self._should_flush_final_buffer():
@@ -153,16 +224,28 @@ class TranslationWorker(threading.Thread):
             return False
         text = self._final_buffer_text()
         latest_text = self._final_buffer[-1]["text"].strip()
+        latest_deferred = self._final_buffer[-1].get("defer_flush", False)
+        if bool(_SENTENCE_END.search(latest_text)) and not latest_deferred:
+            return True
+        compact_len = len(re.sub(r"\s+", "", text))
         return (
-            bool(_SENTENCE_END.search(latest_text))
+            compact_len >= self.cfg.translation_fragment_max_chars
             or len(self._final_buffer) >= self.cfg.translation_fragment_max_segments
-            or len(re.sub(r"\s+", "", text)) >= self.cfg.translation_fragment_max_chars
         )
 
     def _flush_stale_final_buffer(self):
-        if (self._final_buffer
-                and time.monotonic() - self._final_buffer_updated_at
-                >= self.cfg.translation_fragment_flush_seconds):
+        if not self._final_buffer:
+            return
+        latest_text = self._final_buffer[-1]["text"].strip()
+        latest_complete = bool(_SENTENCE_END.search(latest_text))
+        timeout = (
+            self.cfg.translation_fragment_flush_seconds
+            if latest_complete
+            else self.cfg.translation_incomplete_fragment_flush_seconds
+        )
+        if any(entry.get("defer_flush", False) for entry in self._final_buffer):
+            timeout = self.cfg.translation_deferred_fragment_flush_seconds
+        if time.monotonic() - self._final_buffer_updated_at >= timeout:
             self._flush_final_buffer("timeout")
 
     def _flush_final_buffer(self, reason: str):
@@ -184,6 +267,23 @@ class TranslationWorker(threading.Thread):
             entry["text"].strip() for entry in self._final_buffer
             if entry["text"].strip()
         )
+
+    def _split_deferred_fragment(self, text: str) -> tuple[str, str] | None:
+        if not self.cfg.translation_defer_formula_fragments:
+            return None
+        sentences = [s.strip() for s in _SENTENCE_SPLIT.split(text) if s.strip()]
+        if len(sentences) < 2:
+            return None
+        tail = sentences[-1]
+        if len(tail) > self.cfg.translation_formula_fragment_max_chars:
+            return None
+        if not _FORMULA_FRAGMENT_RE.search(tail):
+            return None
+        head = " ".join(sentences[:-1]).strip()
+        previous = sentences[-2]
+        if "formula" not in head.lower() and not _FORMULA_FRAGMENT_RE.search(previous):
+            return None
+        return head, tail
 
     def _translate_one(self, entry: dict):
         if not entry["text"]:
@@ -211,24 +311,45 @@ class TranslationWorker(threading.Thread):
             return
         if self.dictionary is not None and not self._passthrough_source:
             japanese = self.dictionary.apply(japanese)
+        if not self._passthrough_source:
+            repaired = repair_translation_numbers(
+                japanese, entry["text"], self.cfg.source_language)
+            if repaired != japanese and self.cfg.log_latency:
+                print(f"[mt] 原文金額に合わせて補正: {japanese[:60]} -> {repaired[:60]}")
+            japanese = repaired
         raw_japanese = japanese
         cleaned = cleanup_translation_text(
             japanese,
             entry["text"],
             self.cfg.source_language,
             self.cfg.translation_suppressed_phrases,
-            self.cfg.translation_reject_short_cjk,
+            self.cfg.translation_reject_short_cjk and entry["kind"] == "final",
             self.cfg.translation_suspicious_source_min_chars,
             self.cfg.translation_suspicious_target_max_chars,
         )
         if cleaned != japanese and self.cfg.log_latency:
             print(f"[mt] 翻訳幻覚候補を{'除去' if not cleaned else '補正'}: {japanese[:60]}")
         japanese = cleaned
+        if (japanese
+                and not self._passthrough_source
+                and self.cfg.translation_normalize_punctuation):
+            japanese = normalize_japanese_punctuation(
+                japanese, final=entry["kind"] == "final")
         if entry["kind"] == "final" and not japanese:
             if raw_japanese:
-                self._emit_empty_final(entry, "final translation rejected")
+                self._emit_empty_final(
+                    entry,
+                    "final translation rejected",
+                    transcript_ja=raw_japanese,
+                    transcript_ja_label=self.cfg.transcript_rejected_translation_label,
+                )
                 return
-            self._emit_empty_final(entry, "final translation empty")
+            self._emit_empty_final(
+                entry,
+                "final translation empty",
+                transcript_ja="(empty)",
+                transcript_ja_label=self.cfg.transcript_rejected_translation_label,
+            )
             return
         if self.cfg.log_latency:
             elapsed = (time.perf_counter() - start) * 1000
@@ -239,10 +360,17 @@ class TranslationWorker(threading.Thread):
                   "speaker_change": entry.get("speaker_change", False)}
         self._emit_result(result)
 
-    def _emit_empty_final(self, entry: dict, reason: str):
+    def _emit_empty_final(self, entry: dict, reason: str,
+                          transcript_ja: str = "", transcript_ja_label: str = ""):
         source_text = "" if self._passthrough_source else entry["text"]
-        self._emit_result({"kind": "final", "en": source_text, "ja": "",
-                           "speaker_change": entry.get("speaker_change", False)})
+        self._emit_result({
+            "kind": "final",
+            "en": source_text,
+            "ja": "",
+            "transcript_ja": transcript_ja,
+            "transcript_ja_label": transcript_ja_label,
+            "speaker_change": entry.get("speaker_change", False),
+        })
         self._sentence_cache.clear()
         if self.cfg.log_latency:
             print(f"[mt] {reason}; 空の final としてクリア")
@@ -250,9 +378,11 @@ class TranslationWorker(threading.Thread):
     def _emit_result(self, result: dict):
         if result["kind"] == "final" and self.transcript_writer is not None:
             self.transcript_writer.write_final(
-                result.get("en", ""), result.get("ja", ""),
+                result.get("en", ""),
+                result.get("transcript_ja", result.get("ja", "")),
                 self.cfg.remote_transcript_label,
-                self.cfg.remote_transcript_format)
+                self.cfg.remote_transcript_format,
+                result.get("transcript_ja_label", ""))
         self.ui_queue.put(result)
 
     def _translate_final(self, text: str) -> str:
@@ -264,6 +394,9 @@ class TranslationWorker(threading.Thread):
             length_penalty=self.cfg.translation_length_penalty,
             repetition_penalty=self.cfg.translation_repetition_penalty,
             no_repeat_ngram_size=self.cfg.translation_no_repeat_ngram_size,
+            max_decoding_length=self.cfg.translation_max_decoding_length,
+            max_unit_chars=self.cfg.translation_unit_max_chars,
+            split_sentences=not self._should_translate_as_single_pass(text),
         )
 
     def _translate_fast(self, text: str) -> str:
@@ -272,7 +405,16 @@ class TranslationWorker(threading.Thread):
         return self.translator.translate(
             text,
             beam_size=self.cfg.translation_partial_beam_size,
+            max_decoding_length=self.cfg.translation_max_decoding_length,
+            max_unit_chars=self.cfg.translation_unit_max_chars,
+            split_sentences=True,
         )
+
+    def _should_translate_as_single_pass(self, text: str) -> bool:
+        if not self.cfg.translation_final_single_pass:
+            return False
+        compact_len = len(re.sub(r"\s+", "", text))
+        return compact_len <= self.cfg.translation_single_pass_max_chars
 
     def _translate_partial(self, text: str) -> str:
         """完結した文はキャッシュした訳を使い回し、末尾の言いかけの文だけを

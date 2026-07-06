@@ -50,6 +50,8 @@ def main():
     text_queue = queue.Queue()
     ui_queue = queue.Queue()
     mic_capture = None
+    mic_asr = None
+    mic_writer = None
 
     print("=== RT Translator: モデルをロードしています(初回はダウンロードに数分かかります) ===")
     from .dictionary import UserDictionary
@@ -86,7 +88,9 @@ def main():
                 cfg, mic_audio_queue, mic_text_queue, stop_event,
                 speaker_detector=None, dictionary=dictionary,
                 model=asr.model, model_lock=asr.model_lock,
-                source_language=mic_source_language, name="asr-mic")
+                source_language=mic_source_language, name="asr-mic",
+                use_hotwords=cfg.mic_dictionary_hotwords,
+                min_segment_rms=cfg.mic_min_segment_rms)
             mic_writer = TranscriptOnlyWorker(
                 cfg, mic_text_queue, stop_event, transcript_writer,
                 mic_source_language, cfg.mic_transcript_label)
@@ -109,6 +113,12 @@ def main():
         capture.stop()
         if mic_capture is not None:
             mic_capture.stop()
+        asr.join(timeout=cfg.shutdown_drain_seconds + 1.0)
+        if mic_asr is not None:
+            mic_asr.join(timeout=cfg.shutdown_drain_seconds + 1.0)
+        mt.join(timeout=cfg.shutdown_drain_seconds + 5.0)
+        if mic_writer is not None:
+            mic_writer.join(timeout=cfg.shutdown_drain_seconds + 1.0)
 
 
 if __name__ == "__main__":
