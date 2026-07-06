@@ -86,7 +86,9 @@ def main():
                 cfg, mic_audio_queue, mic_text_queue, stop_event,
                 speaker_detector=None, dictionary=dictionary,
                 model=asr.model, model_lock=asr.model_lock,
-                source_language=mic_source_language, name="asr-mic")
+                source_language=mic_source_language, name="asr-mic",
+                use_hotwords=cfg.mic_dictionary_hotwords,
+                min_segment_rms=cfg.mic_min_segment_rms)
             mic_writer = TranscriptOnlyWorker(
                 cfg, mic_text_queue, stop_event, transcript_writer,
                 mic_source_language, cfg.mic_transcript_label)

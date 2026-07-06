@@ -23,7 +23,9 @@ class StreamingTranscriber(threading.Thread):
     def __init__(self, cfg: Config, audio_queue: queue.Queue, out_queue: queue.Queue,
                  stop_event: threading.Event, speaker_detector=None, dictionary=None,
                  model=None, model_lock=None, source_language: str | None = None,
-                 name: str = "asr", emit_partials: bool = True):
+                 name: str = "asr", emit_partials: bool = True,
+                 use_hotwords: bool = True,
+                 min_segment_rms: float | None = None):
         super().__init__(daemon=True, name=name)
         self.cfg = cfg
         self.audio_queue = audio_queue
@@ -35,6 +37,8 @@ class StreamingTranscriber(threading.Thread):
         self.model_lock = model_lock if model_lock is not None else threading.Lock()
         self.source_language = source_language or cfg.source_language
         self.emit_partials = emit_partials
+        self.use_hotwords = use_hotwords
+        self.min_segment_rms = min_segment_rms
         # speech_pad_ms 既定値(400ms)は発話間のポーズを潰して文単位の確定を
         # 妨げるので短くする(セグメント切り出し時に自前で前パディングする)
         self._vad_options = VadOptions(min_silence_duration_ms=250, speech_pad_ms=100)
@@ -123,7 +127,10 @@ class StreamingTranscriber(threading.Thread):
                 buffer = buffer[split_end:]
                 last_partial_len = 0
                 last_partial_at = 0.0
-                if (split_end - speech_start) / TARGET_RATE < cfg.min_speech:
+                voiced_sec = self._speech_duration(speech, speech_start, split_end)
+                if not self._is_usable_segment(segment, voiced_sec, "final"):
+                    self.out_queue.put({"kind": "final", "text": "",
+                                        "speaker_change": False})
                     continue
                 text = self._transcribe(segment, beam_size=cfg.final_beam_size, kind="final")
                 speaker_change = False
@@ -135,14 +142,15 @@ class StreamingTranscriber(threading.Thread):
                                     "speaker_change": speaker_change})
             elif self.emit_partials and time.monotonic() - last_partial_at >= cfg.partial_interval:
                 speech_end = speech[-1]["end"]
-                if (speech_end - speech_start) / TARGET_RATE < cfg.min_speech:
+                voiced_sec = self._speech_duration(speech, speech_start, speech_end)
+                segment = buffer[max(0, speech_start - TARGET_RATE // 4):]
+                if not self._is_usable_segment(segment, voiced_sec, "partial"):
                     continue
                 # 前回の暫定認識から音声が伸びていなければスキップ
                 if speech_end <= last_partial_len:
                     continue
                 last_partial_at = time.monotonic()
                 last_partial_len = speech_end
-                segment = buffer[max(0, speech_start - TARGET_RATE // 4):]
                 speaker_change = False
                 if self.speaker_detector is not None:
                     speaker_change = self.speaker_detector.peek_change(segment)
@@ -152,7 +160,8 @@ class StreamingTranscriber(threading.Thread):
 
     def _transcribe(self, audio: np.ndarray, beam_size: int, kind: str) -> str:
         start = time.perf_counter()
-        hotwords = self.dictionary.hotwords(self.source_language) if self.dictionary else None
+        hotwords = (self.dictionary.hotwords(self.source_language)
+                    if self.dictionary is not None and self.use_hotwords else None)
         with self.model_lock:
             segments, _ = self.model.transcribe(
                 audio,
@@ -186,10 +195,50 @@ class StreamingTranscriber(threading.Thread):
             print(f"[asr] {kind} {audio_sec:.1f}s -> {elapsed:.0f}ms: {text[:60]}")
         return text
 
+    def _speech_duration(self, speech: list[dict], start: int, end: int) -> float:
+        samples = 0
+        for item in speech:
+            overlap_start = max(start, item["start"])
+            overlap_end = min(end, item["end"])
+            if overlap_end > overlap_start:
+                samples += overlap_end - overlap_start
+        return samples / TARGET_RATE
+
+    def _segment_rms_threshold(self) -> float:
+        if self.min_segment_rms is not None:
+            return self.min_segment_rms
+        return self.cfg.asr_min_segment_rms
+
+    def _is_usable_segment(self, audio: np.ndarray, voiced_sec: float, kind: str) -> bool:
+        if voiced_sec < self.cfg.min_speech:
+            if self.cfg.log_latency and kind == "final":
+                print(f"[asr] 短すぎる発話を破棄: voiced={voiced_sec:.2f}s")
+            return False
+        if audio.size == 0:
+            return False
+
+        peak_threshold = self.cfg.asr_min_segment_peak
+        if peak_threshold > 0:
+            peak = float(np.max(np.abs(audio)))
+            if peak < peak_threshold:
+                if self.cfg.log_latency and kind == "final":
+                    print(f"[asr] ほぼ無音の発話を破棄: peak={peak:.4f}")
+                return False
+
+        rms_threshold = self._segment_rms_threshold()
+        if rms_threshold > 0:
+            rms = float(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
+            if rms < rms_threshold:
+                if self.cfg.log_latency and kind == "final":
+                    print(f"[asr] 低音量の発話を破棄: rms={rms:.4f}")
+                return False
+        return True
+
     def _cleanup_text(self, text: str) -> str:
         return cleanup_asr_text(
             text,
             self.source_language,
             self.cfg.asr_suppressed_phrases,
             self.cfg.english_asr_reject_cjk,
+            self.cfg.asr_suppressed_substring_max_chars,
         )

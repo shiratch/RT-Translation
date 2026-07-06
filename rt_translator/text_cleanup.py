@@ -1,17 +1,21 @@
 """ASR/翻訳出力の繰り返し幻覚を抑制する。"""
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import re
 
 TOKEN_REPETITION_MIN = 8
 SUBSTRING_REPETITION_MIN = 24
 DEFAULT_ASR_SUPPRESSED_PHRASES = [
+    "Amazon",
     "栗子",
     "株式 関値 位置ループ",
+    "株式 閾値 位置ループ",
     "ご視聴ありがとうございました",
     "ご清聴ありがとうございました",
 ]
 DEFAULT_TRANSLATION_SUPPRESSED_PHRASES = [
     "栗子",
     "株式 関値 位置ループ",
+    "株式 閾値 位置ループ",
     "ご視聴ありがとうございました",
     "ご清聴ありがとうございました",
 ]
@@ -21,6 +25,20 @@ _HIRAGANA_RE = re.compile(r"[\u3040-\u309f]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
 _PHRASE_PUNCT_RE = re.compile(r"[\s　、。,.!?！？]+")
 _ENGLISH_SOURCE_LANGS = {"en", "eng", "english", "en_us", "en_gb", "eng_latn"}
+_ENGLISH_THOUSAND_ASR_RE = re.compile(r"\b(\d{2,3}),0\b")
+_SOURCE_USD_RE = re.compile(
+    r"\$\s*(\d+(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)\s*"
+    r"(billion|million|thousand|bn|b|m|k)?\b",
+    re.IGNORECASE,
+)
+_TARGET_USD_RE = re.compile(
+    r"(\d+(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)\s*(億|万)?\s*(米ドル|ドル)"
+)
+_SUPPRESSED_SUBSTRING_SEEDS = {
+    "栗子",
+    "株式関値位置ループ",
+    "株式閾値位置ループ",
+}
 
 
 def _is_mostly_repetition(text_len: int, removed: int, min_len: int) -> bool:
@@ -102,6 +120,12 @@ def _is_english_source_language(language: str) -> bool:
     return language.lower().replace("-", "_") in _ENGLISH_SOURCE_LANGS
 
 
+def _repair_english_asr_numbers(text: str, source_language: str) -> str:
+    if not _is_english_source_language(source_language):
+        return text
+    return _ENGLISH_THOUSAND_ASR_RE.sub(r"\1,000", text)
+
+
 def _normalize_phrase(text: str) -> str:
     return _PHRASE_PUNCT_RE.sub("", text).lower()
 
@@ -110,11 +134,28 @@ def _compact_len(text: str) -> int:
     return len(_normalize_phrase(text))
 
 
+def _matches_suppressed_phrase(normalized: str,
+                               phrases: list[str] | tuple[str, ...],
+                               substring_max_chars: int = 0) -> bool:
+    if not normalized:
+        return False
+    normalized_phrases = {_normalize_phrase(p) for p in phrases if p.strip()}
+    if normalized in normalized_phrases:
+        return True
+    if substring_max_chars <= 0 or len(normalized) > substring_max_chars:
+        return False
+    return any(seed in normalized and seed in normalized_phrases
+               for seed in _SUPPRESSED_SUBSTRING_SEEDS)
+
+
 def cleanup_asr_text(text: str, source_language: str,
                      suppressed_phrases: list[str] | tuple[str, ...] | None = None,
-                     reject_cjk_for_english: bool = True) -> str:
+                     reject_cjk_for_english: bool = True,
+                     suppressed_substring_max_chars: int = 12) -> str:
     """ASR専用の後処理。翻訳結果には適用しない。"""
+    text = _repair_english_asr_numbers(text, source_language)
     text = collapse_repeats(text).strip()
+    text = _repair_english_asr_numbers(text, source_language)
     if not text:
         return ""
 
@@ -122,7 +163,8 @@ def cleanup_asr_text(text: str, source_language: str,
     if phrases is None:
         phrases = DEFAULT_ASR_SUPPRESSED_PHRASES
     normalized = _normalize_phrase(text)
-    if normalized and normalized in {_normalize_phrase(p) for p in phrases}:
+    if _matches_suppressed_phrase(
+            normalized, phrases, suppressed_substring_max_chars):
         return ""
 
     if (reject_cjk_for_english
@@ -131,6 +173,68 @@ def cleanup_asr_text(text: str, source_language: str,
             and not _LATIN_RE.search(text)):
         return ""
     return text
+
+
+def _source_usd_amounts(source_text: str) -> list[Decimal]:
+    amounts: list[Decimal] = []
+    multipliers = {
+        "thousand": Decimal("1000"),
+        "k": Decimal("1000"),
+        "million": Decimal("1000000"),
+        "m": Decimal("1000000"),
+        "billion": Decimal("1000000000"),
+        "bn": Decimal("1000000000"),
+        "b": Decimal("1000000000"),
+    }
+    for match in _SOURCE_USD_RE.finditer(source_text):
+        number_text = match.group(1).replace(",", "")
+        try:
+            amount = Decimal(number_text)
+        except InvalidOperation:
+            continue
+        unit = (match.group(2) or "").lower()
+        amount *= multipliers.get(unit, Decimal("1"))
+        amounts.append(amount)
+    return amounts
+
+
+def _whole_number(value: Decimal) -> int:
+    return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _format_usd_for_japanese(value: Decimal) -> str:
+    amount = _whole_number(value)
+    if amount >= 100_000_000:
+        oku, rest = divmod(amount, 100_000_000)
+        if rest == 0:
+            return f"{oku}億ドル"
+        if rest % 10_000 == 0:
+            return f"{oku}億{rest // 10_000}万ドル"
+        return f"{amount:,}ドル"
+    if amount >= 10_000:
+        man, rest = divmod(amount, 10_000)
+        if rest == 0:
+            return f"{man}万ドル"
+        return f"{amount:,}ドル"
+    return f"{amount:,}ドル"
+
+
+def repair_translation_numbers(text: str, source_text: str,
+                               source_language: str) -> str:
+    """原文にあるドル金額を優先し、NLLBの桁落ちした日本語金額を補正する。"""
+    if not _is_english_source_language(source_language):
+        return text
+    amounts = _source_usd_amounts(source_text)
+    if not amounts:
+        return text
+
+    repaired = text
+    for amount in amounts:
+        replacement = _format_usd_for_japanese(amount)
+        repaired, count = _TARGET_USD_RE.subn(replacement, repaired, count=1)
+        if count == 0:
+            break
+    return repaired
 
 
 def cleanup_translation_text(text: str, source_text: str, source_language: str,
@@ -147,7 +251,7 @@ def cleanup_translation_text(text: str, source_text: str, source_language: str,
     if phrases is None:
         phrases = DEFAULT_TRANSLATION_SUPPRESSED_PHRASES
     normalized = _normalize_phrase(text)
-    if normalized and normalized in {_normalize_phrase(p) for p in phrases}:
+    if _matches_suppressed_phrase(normalized, phrases, target_max_chars):
         return ""
 
     if (reject_short_cjk

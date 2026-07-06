@@ -36,7 +36,7 @@ class TranscriptWriter:
         print(f"[transcript] 保存先: {self.path}")
 
     def write_final(self, en: str, ja: str, source_label: str = "",
-                    transcript_format: str = ""):
+                    transcript_format: str = "", ja_label: str = ""):
         if not self.enabled or self.path is None:
             return
 
@@ -61,9 +61,13 @@ class TranscriptWriter:
             if header:
                 lines.append(header)
             if en:
-                lines.append(f"EN: {en}")
+                lines.append(f"{self.cfg.transcript_english_label}: {en}")
             if ja:
-                lines.append(f"JA: {ja}")
+                label = ja_label or (
+                    self.cfg.transcript_translation_label if en
+                    else self.cfg.transcript_japanese_label
+                )
+                lines.append(f"{label}: {ja}")
             lines.append("")
 
         self._append(lines)
