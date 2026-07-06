@@ -157,6 +157,7 @@ class StreamingTranscriber(threading.Thread):
                 text = self._transcribe(segment, beam_size=cfg.partial_beam_size, kind="partial")
                 self.out_queue.put({"kind": "partial", "text": text,
                                     "speaker_change": speaker_change})
+        self._flush_remaining_buffer(buffer)
 
     def _transcribe(self, audio: np.ndarray, beam_size: int, kind: str) -> str:
         start = time.perf_counter()
@@ -194,6 +195,26 @@ class StreamingTranscriber(threading.Thread):
             audio_sec = len(audio) / TARGET_RATE
             print(f"[asr] {kind} {audio_sec:.1f}s -> {elapsed:.0f}ms: {text[:60]}")
         return text
+
+    def _flush_remaining_buffer(self, buffer: np.ndarray):
+        """終了時に無音確定を待っていた最後の発話を final として流す。"""
+        if len(buffer) < int(0.3 * TARGET_RATE):
+            return
+        speech = get_speech_timestamps(buffer, self._vad_options)
+        if not speech:
+            return
+        speech_start = speech[0]["start"]
+        speech_end = speech[-1]["end"]
+        segment = buffer[max(0, speech_start - TARGET_RATE // 4):speech_end]
+        voiced_sec = self._speech_duration(speech, speech_start, speech_end)
+        if not self._is_usable_segment(segment, voiced_sec, "final"):
+            return
+        text = self._transcribe(segment, beam_size=self.cfg.final_beam_size, kind="final")
+        speaker_change = False
+        if text and self.speaker_detector is not None:
+            speaker_change = self.speaker_detector.is_change(segment)
+        self.out_queue.put({"kind": "final", "text": text,
+                            "speaker_change": speaker_change})
 
     def _speech_duration(self, speech: list[dict], start: int, end: int) -> float:
         samples = 0

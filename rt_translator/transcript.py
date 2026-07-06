@@ -3,6 +3,7 @@ from datetime import datetime
 from pathlib import Path
 import queue
 import threading
+import time
 
 from .config import Config
 
@@ -108,7 +109,15 @@ class TranscriptOnlyWorker(threading.Thread):
         self.source_label = source_label
 
     def run(self):
-        while not self.stop_event.is_set():
+        idle_since = 0.0
+        while True:
+            if self.stop_event.is_set() and self.in_queue.empty():
+                if not idle_since:
+                    idle_since = time.monotonic()
+                elif time.monotonic() - idle_since >= self.cfg.shutdown_drain_seconds:
+                    break
+            else:
+                idle_since = 0.0
             try:
                 item = self.in_queue.get(timeout=0.1)
             except queue.Empty:

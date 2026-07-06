@@ -13,8 +13,8 @@ class Config:
     whisper_compute_type: str = "int8_float16"
     source_language: str = "en"
     partial_interval: float = 0.8       # 発話中に暫定認識を回す間隔 [秒]
-    silence_finalize: float = 0.6       # この長さの無音でセグメント確定 [秒]
-    max_utterance: float = 18.0         # 強制確定までの最大発話長 [秒]
+    silence_finalize: float = 0.45      # この長さの無音でセグメント確定 [秒]
+    max_utterance: float = 9.0          # 強制確定までの最大発話長 [秒]
     min_speech: float = 0.30            # VAD上の実発話累計がこれ未満なら無視 [秒]
     asr_min_segment_peak: float = 1e-3  # ほぼ無音の塊をWhisperへ渡さない
     asr_min_segment_rms: float = 0.0    # 相手音声用RMSゲート(0で無効)
@@ -42,13 +42,15 @@ class Config:
     translation_repetition_penalty: float = 1.1
     translation_no_repeat_ngram_size: int = 3
     translation_max_decoding_length: int = 256
+    translation_unit_max_chars: int = 120
     translation_final_single_pass: bool = True
-    translation_single_pass_max_chars: int = 220
+    translation_single_pass_max_chars: int = 160
     translation_buffer_final_fragments: bool = True
-    translation_fragment_flush_seconds: float = 1.2
+    translation_fragment_flush_seconds: float = 0.6
+    translation_incomplete_fragment_flush_seconds: float = 2.0
     translation_deferred_fragment_flush_seconds: float = 4.0
-    translation_fragment_max_chars: int = 140
-    translation_fragment_max_segments: int = 3
+    translation_fragment_max_chars: int = 220
+    translation_fragment_max_segments: int = 4
     translation_defer_formula_fragments: bool = True
     translation_formula_fragment_max_chars: int = 80
     translation_suppressed_phrases: list[str] = dataclasses.field(default_factory=lambda: [
@@ -61,6 +63,7 @@ class Config:
     translation_reject_short_cjk: bool = True
     translation_suspicious_source_min_chars: int = 24
     translation_suspicious_target_max_chars: int = 12
+    translation_normalize_punctuation: bool = True
 
     # --- 話者交代検出 ---
     speaker_change_detection: bool = True
@@ -101,6 +104,7 @@ class Config:
     log_latency: bool = True            # 各段の処理時間をコンソールに出す
     user_dictionary: str = "user_dictionary.txt"  # ユーザー辞書(VoiceText と同書式)
     hallucinations_file: str = "hallucinations.txt"  # 1行1語句の幻覚抑制リスト
+    shutdown_drain_seconds: float = 5.0  # 終了時に残りのASR/翻訳キューを処理する猶予
 
 
 def _apply_values(cfg: Config, data: dict, source: str):

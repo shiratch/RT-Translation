@@ -34,6 +34,12 @@ _SOURCE_USD_RE = re.compile(
 _TARGET_USD_RE = re.compile(
     r"(\d+(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)\s*(億|万)?\s*(米ドル|ドル)"
 )
+_JA_TERMINAL_PUNCT_RE = re.compile(r"[。！？!?…）」』】》〉]$")
+_ASCII_PUNCT_TRANSLATION = str.maketrans({
+    ",": "、",
+    "?": "？",
+    "!": "！",
+})
 _SUPPRESSED_SUBSTRING_SEEDS = {
     "栗子",
     "株式関値位置ループ",
@@ -235,6 +241,22 @@ def repair_translation_numbers(text: str, source_text: str,
         if count == 0:
             break
     return repaired
+
+
+def normalize_japanese_punctuation(text: str, final: bool = False) -> str:
+    """NLLBが落としがちな日本語句読点を字幕向けに最低限整える。"""
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    text = text.translate(_ASCII_PUNCT_TRANSLATION)
+    # 数値の小数点は壊さず、文末/空白前のピリオドだけ句点に寄せる。
+    text = re.sub(r"(?<!\d)\.(?!\d)", "。", text)
+    text = re.sub(r"\s*([、。！？])\s*", r"\1", text)
+    text = re.sub(r"([、。！？]){2,}", r"\1", text)
+    text = re.sub(r"、([。！？])", r"\1", text)
+    if final and not _JA_TERMINAL_PUNCT_RE.search(text):
+        text += "。"
+    return text
 
 
 def cleanup_translation_text(text: str, source_text: str, source_language: str,

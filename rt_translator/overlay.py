@@ -115,26 +115,37 @@ class SubtitleOverlay:
         self._live_source = ""
         self._render()
 
-    def _visible_finals(self) -> list:
-        n = self.cfg.final_lines
-        end = len(self.history) - self.view_offset
-        return list(self.history)[max(0, end - n):end]
-
     def _count_lines(self, text: str) -> int:
         """wraplength での折り返しを含めた表示行数を見積もる。"""
-        total = 0
+        return len(self._wrap_text_lines(text))
+
+    def _wrap_text_lines(self, text: str) -> list[str]:
+        """現在のフォント幅で、Tkの折り返しに近い表示行へ分解する。"""
+        lines = []
         for para in text.split("\n"):
+            if not para:
+                lines.append("")
+                continue
+            line = ""
             width = 0
-            lines = 1
             for ch in para:
                 w = self._font_main.measure(ch)
-                if width + w > self._wraplength and width > 0:
-                    lines += 1
+                if width + w > self._wraplength and line:
+                    lines.append(line)
+                    line = ch
                     width = w
                 else:
+                    line += ch
                     width += w
-            total += lines
-        return total
+            lines.append(line)
+        return lines or [""]
+
+    def _final_history_lines(self) -> list[str]:
+        marker = "– " if self.cfg.speaker_change_detection else ""
+        lines = []
+        for turn in self.history:
+            lines.extend(self._wrap_text_lines(marker + turn))
+        return lines
 
     def _tail_fit(self, text: str, max_lines: int) -> str:
         """max_lines 行に収まるように文頭側を「…」で切り詰める。"""
@@ -164,19 +175,10 @@ class SubtitleOverlay:
         partial = self._tail_fit(partial, 2) if partial else ""
         budget = max(1, self.cfg.final_lines - (self._count_lines(partial) if partial else 0))
 
-        chosen = []
-        used = 0
-        for turn in reversed(self._visible_finals()):
-            text = marker + turn
-            lines = self._count_lines(text)
-            if used + lines > budget:
-                if not chosen:  # 最新ターン単体で収まらない場合は頭を切り詰める
-                    chosen.append(self._tail_fit(text, budget))
-                break
-            chosen.append(text)
-            used += lines
-
-        self.label_final.configure(text="\n".join(reversed(chosen)))
+        final_lines = self._final_history_lines()
+        end = max(0, len(final_lines) - self.view_offset)
+        start = max(0, end - budget)
+        self.label_final.configure(text="\n".join(final_lines[start:end]))
         self.label_partial.configure(text=partial)
         if self.cfg.show_source:
             self.label_source.configure(text=self._live_source if live else "")
@@ -190,8 +192,10 @@ class SubtitleOverlay:
 
     # ---------- スクロール ----------
 
-    def _max_offset(self) -> int:
-        return max(0, len(self.history) - self.cfg.final_lines)
+    def _max_offset(self, budget: int | None = None) -> int:
+        if budget is None:
+            budget = max(1, self.cfg.final_lines - 1)
+        return max(0, len(self._final_history_lines()) - budget)
 
     def _set_offset(self, offset: int):
         offset = max(0, min(self._max_offset(), offset))
@@ -209,13 +213,13 @@ class SubtitleOverlay:
     def _draw_scrollbar(self):
         self.scrollbar.delete("all")
         h = self.scrollbar.winfo_height()
-        total = len(self.history)
-        n = self.cfg.final_lines
+        total = len(self._final_history_lines())
+        n = max(1, self.cfg.final_lines - (1 if self.view_offset else 0))
         if total <= n:
             thumb_top, thumb_h = 0, h
         else:
             thumb_h = max(THUMB_MIN_H, int(h * n / total))
-            max_off = self._max_offset()
+            max_off = self._max_offset(n)
             # offset=max_off が最上部(最古)、offset=0 が最下部(最新)
             ratio = 1.0 - self.view_offset / max_off
             thumb_top = int((h - thumb_h) * ratio)
@@ -253,19 +257,20 @@ class SubtitleOverlay:
         話者交代(または検出無効・長すぎ)で新しいターン(行)を始める。"""
         if not item["ja"]:  # 幻覚破棄によるクリア指示
             return
+        old_lines = len(self._final_history_lines())
         same_speaker = (self.cfg.speaker_change_detection
                         and not item.get("speaker_change", False)
                         and len(self.history) > 0
                         and len(self.history[-1]) < MAX_TURN_CHARS)
         if same_speaker:
             self.history[-1] = self.history[-1] + item["ja"]
-            return
-        at_capacity = len(self.history) == MAX_HISTORY
-        self.history.append(item["ja"])
+        else:
+            self.history.append(item["ja"])
         # 遡り中は表示位置を固定する(deque が満杯のときは全体が
         # 1 つずれるので補正不要)
-        if self.view_offset > 0 and not at_capacity:
-            self.view_offset = min(self._max_offset(), self.view_offset + 1)
+        if self.view_offset > 0:
+            delta = max(0, len(self._final_history_lines()) - old_lines)
+            self.view_offset = min(self._max_offset(), self.view_offset + delta)
 
     def _poll(self):
         if self.stop_event.is_set():
@@ -284,15 +289,19 @@ class SubtitleOverlay:
                 self._live_partial_change = False
                 self._live_source = item["en"]
             else:
-                self._live_partial = item["ja"]
-                self._live_partial_change = item.get("speaker_change", False)
-                self._live_source = item["en"]
+                # 空の partial は、翻訳の一時的な空振りで出ることがある。
+                # 確定 final までは最後の非空 partial を残し、字幕の全消えを防ぐ。
+                if item.get("ja"):
+                    self._live_partial = item["ja"]
+                    self._live_partial_change = item.get("speaker_change", False)
+                if item.get("en"):
+                    self._live_source = item["en"]
         if updated:
             self._render()
         self.root.after(50, self._poll)
 
     def close(self):
-        self.stop_event.set()
+        self.root.quit()
 
     def run(self):
         self.root.mainloop()

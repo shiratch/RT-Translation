@@ -10,7 +10,8 @@ import threading
 import time
 
 from .config import Config
-from .text_cleanup import cleanup_translation_text, repair_translation_numbers
+from .text_cleanup import (cleanup_translation_text, normalize_japanese_punctuation,
+                           repair_translation_numbers)
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 _SENTENCE_END = re.compile(r'[.!?。！？]["\')\]]*\s*$')
@@ -32,6 +33,7 @@ class Translator:
                   repetition_penalty: float = 1.0,
                   no_repeat_ngram_size: int = 0,
                   max_decoding_length: int = 256,
+                  max_unit_chars: int = 180,
                   split_sentences: bool = True) -> str:
         raise NotImplementedError
 
@@ -64,10 +66,11 @@ class NllbCT2Translator(Translator):
                   repetition_penalty: float = 1.0,
                   no_repeat_ngram_size: int = 0,
                   max_decoding_length: int = 256,
+                  max_unit_chars: int = 180,
                   split_sentences: bool = True) -> str:
         # 長文は文単位に分割するが、確定字幕の短〜中程度の段落は文脈を
         # 保ったまま一括入力する方が、断片訳になりにくい。
-        units = self._translation_units(text, split_sentences)
+        units = self._translation_units(text, split_sentences, max_unit_chars)
         batch = [self.tokenizer.convert_ids_to_tokens(self.tokenizer.encode(unit))
                  for unit in units]
         translate_kwargs = {
@@ -95,10 +98,41 @@ class NllbCT2Translator(Translator):
             translated.append(self.tokenizer.decode(ids, skip_special_tokens=True).strip())
         return " ".join(translated)
 
-    def _translation_units(self, text: str, split_sentences: bool) -> list[str]:
+    def _translation_units(self, text: str, split_sentences: bool,
+                           max_unit_chars: int) -> list[str]:
         if not split_sentences:
             return [text.strip()] if text.strip() else [text]
-        return [s for s in _SENTENCE_SPLIT.split(text) if s.strip()] or [text]
+        units = [s for s in _SENTENCE_SPLIT.split(text) if s.strip()] or [text]
+        split_units = []
+        for unit in units:
+            split_units.extend(self._split_long_unit(unit, max_unit_chars))
+        return split_units
+
+    def _split_long_unit(self, text: str, max_chars: int) -> list[str]:
+        if max_chars <= 0 or len(text) <= max_chars:
+            return [text]
+        separators = (
+            ", ", "; ", ": ", " and ", " but ", " which ", " because ",
+            " so ", " at the moment ", " to ", " from ",
+        )
+        chunks = []
+        rest = text.strip()
+        min_cut = max(40, max_chars // 3)
+        while len(rest) > max_chars:
+            cut = 0
+            for sep in separators:
+                pos = rest.rfind(sep, min_cut, max_chars + 1)
+                if pos > cut:
+                    cut = pos + len(sep)
+            if cut <= 0:
+                cut = rest.rfind(" ", min_cut, max_chars + 1)
+            if cut <= 0:
+                cut = max_chars
+            chunks.append(rest[:cut].strip())
+            rest = rest[cut:].strip()
+        if rest:
+            chunks.append(rest)
+        return chunks
 
 
 class TranslationWorker(threading.Thread):
@@ -121,7 +155,15 @@ class TranslationWorker(threading.Thread):
         self._final_buffer_updated_at = 0.0
 
     def run(self):
-        while not self.stop_event.is_set():
+        idle_since = 0.0
+        while True:
+            if self.stop_event.is_set() and self.in_queue.empty():
+                if not idle_since:
+                    idle_since = time.monotonic()
+                elif time.monotonic() - idle_since >= self.cfg.shutdown_drain_seconds:
+                    break
+            else:
+                idle_since = 0.0
             try:
                 item = self.in_queue.get(timeout=0.1)
             except queue.Empty:
@@ -183,16 +225,24 @@ class TranslationWorker(threading.Thread):
         text = self._final_buffer_text()
         latest_text = self._final_buffer[-1]["text"].strip()
         latest_deferred = self._final_buffer[-1].get("defer_flush", False)
+        if bool(_SENTENCE_END.search(latest_text)) and not latest_deferred:
+            return True
+        compact_len = len(re.sub(r"\s+", "", text))
         return (
-            (bool(_SENTENCE_END.search(latest_text)) and not latest_deferred)
+            compact_len >= self.cfg.translation_fragment_max_chars
             or len(self._final_buffer) >= self.cfg.translation_fragment_max_segments
-            or len(re.sub(r"\s+", "", text)) >= self.cfg.translation_fragment_max_chars
         )
 
     def _flush_stale_final_buffer(self):
         if not self._final_buffer:
             return
-        timeout = self.cfg.translation_fragment_flush_seconds
+        latest_text = self._final_buffer[-1]["text"].strip()
+        latest_complete = bool(_SENTENCE_END.search(latest_text))
+        timeout = (
+            self.cfg.translation_fragment_flush_seconds
+            if latest_complete
+            else self.cfg.translation_incomplete_fragment_flush_seconds
+        )
         if any(entry.get("defer_flush", False) for entry in self._final_buffer):
             timeout = self.cfg.translation_deferred_fragment_flush_seconds
         if time.monotonic() - self._final_buffer_updated_at >= timeout:
@@ -273,13 +323,18 @@ class TranslationWorker(threading.Thread):
             entry["text"],
             self.cfg.source_language,
             self.cfg.translation_suppressed_phrases,
-            self.cfg.translation_reject_short_cjk,
+            self.cfg.translation_reject_short_cjk and entry["kind"] == "final",
             self.cfg.translation_suspicious_source_min_chars,
             self.cfg.translation_suspicious_target_max_chars,
         )
         if cleaned != japanese and self.cfg.log_latency:
             print(f"[mt] 翻訳幻覚候補を{'除去' if not cleaned else '補正'}: {japanese[:60]}")
         japanese = cleaned
+        if (japanese
+                and not self._passthrough_source
+                and self.cfg.translation_normalize_punctuation):
+            japanese = normalize_japanese_punctuation(
+                japanese, final=entry["kind"] == "final")
         if entry["kind"] == "final" and not japanese:
             if raw_japanese:
                 self._emit_empty_final(
@@ -340,6 +395,7 @@ class TranslationWorker(threading.Thread):
             repetition_penalty=self.cfg.translation_repetition_penalty,
             no_repeat_ngram_size=self.cfg.translation_no_repeat_ngram_size,
             max_decoding_length=self.cfg.translation_max_decoding_length,
+            max_unit_chars=self.cfg.translation_unit_max_chars,
             split_sentences=not self._should_translate_as_single_pass(text),
         )
 
@@ -350,6 +406,7 @@ class TranslationWorker(threading.Thread):
             text,
             beam_size=self.cfg.translation_partial_beam_size,
             max_decoding_length=self.cfg.translation_max_decoding_length,
+            max_unit_chars=self.cfg.translation_unit_max_chars,
             split_sentences=True,
         )
 
