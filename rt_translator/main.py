@@ -24,6 +24,15 @@ def _add_nvidia_dll_dirs():
             os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ["PATH"]
 
 
+def _source_language_label(language: str, is_japanese_source_language) -> str:
+    normalized = language.lower().replace("-", "_")
+    if is_japanese_source_language(language):
+        return "日本語音声"
+    if normalized in {"en", "eng", "english", "en_us", "en_gb", "eng_latn"}:
+        return "英語音声"
+    return f"{language}音声"
+
+
 def main():
     _add_nvidia_dll_dirs()
 
@@ -90,7 +99,7 @@ def main():
                 mic_capture.stop()
                 mic_capture = None
 
-    language_label = "日本語音声" if is_japanese_source_language(cfg.source_language) else "英語音声"
+    language_label = _source_language_label(cfg.source_language, is_japanese_source_language)
     print(f"=== 準備完了。{language_label}を再生すると字幕が表示されます(字幕右クリックで終了) ===")
     overlay = SubtitleOverlay(cfg, ui_queue, stop_event)
     try:

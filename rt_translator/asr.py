@@ -16,7 +16,7 @@ from faster_whisper.vad import VadOptions, get_speech_timestamps
 
 from .audio_capture import TARGET_RATE
 from .config import Config
-from .text_cleanup import collapse_repeats
+from .text_cleanup import cleanup_asr_text
 
 
 class StreamingTranscriber(threading.Thread):
@@ -57,7 +57,6 @@ class StreamingTranscriber(threading.Thread):
         buffer = np.zeros(0, dtype=np.float32)
         last_partial_at = 0.0
         last_partial_len = 0
-        last_partial_text = ""
         last_audio_at = time.monotonic()
         last_speaker_check = 0.0
         silence_block = np.zeros(TARGET_RATE // 10, dtype=np.float32)
@@ -87,6 +86,8 @@ class StreamingTranscriber(threading.Thread):
             if not speech:
                 # 発話なし: 直近 1 秒だけ残して捨てる(発話頭の欠落防止)
                 buffer = buffer[-TARGET_RATE:]
+                last_partial_at = 0.0
+                last_partial_len = 0
                 continue
 
             silence_samples = int(cfg.silence_finalize * TARGET_RATE)
@@ -106,7 +107,9 @@ class StreamingTranscriber(threading.Thread):
                     last_speaker_check = time.monotonic()
                     before = buffer[speech_start:prev["end"]]
                     after = buffer[nxt["start"]:speech[-1]["end"]]
-                    if self.speaker_detector.is_boundary(before, after):
+                    speaker_changed = self.speaker_detector.is_boundary(before, after)
+                    check_speaker = False
+                    if speaker_changed:
                         split_end = prev["end"]
                         break
             if split_end is None:
@@ -121,13 +124,8 @@ class StreamingTranscriber(threading.Thread):
                 last_partial_len = 0
                 last_partial_at = 0.0
                 if (split_end - speech_start) / TARGET_RATE < cfg.min_speech:
-                    last_partial_text = ""
                     continue
                 text = self._transcribe(segment, beam_size=cfg.final_beam_size, kind="final")
-                if not text and last_partial_text:
-                    text = last_partial_text
-                    if cfg.log_latency:
-                        print(f"[asr] final が空のため直近の partial を採用: {text[:60]}")
                 speaker_change = False
                 # 幻覚破棄したセグメント(音楽等)では声紋の基準を更新しない
                 if text and self.speaker_detector is not None:
@@ -135,7 +133,6 @@ class StreamingTranscriber(threading.Thread):
                 # text が空(幻覚破棄)でも流し、画面のグレー字幕をクリアさせる
                 self.out_queue.put({"kind": "final", "text": text,
                                     "speaker_change": speaker_change})
-                last_partial_text = ""
             elif self.emit_partials and time.monotonic() - last_partial_at >= cfg.partial_interval:
                 speech_end = speech[-1]["end"]
                 if (speech_end - speech_start) / TARGET_RATE < cfg.min_speech:
@@ -150,14 +147,12 @@ class StreamingTranscriber(threading.Thread):
                 if self.speaker_detector is not None:
                     speaker_change = self.speaker_detector.peek_change(segment)
                 text = self._transcribe(segment, beam_size=cfg.partial_beam_size, kind="partial")
-                if text:
-                    last_partial_text = text
                 self.out_queue.put({"kind": "partial", "text": text,
                                     "speaker_change": speaker_change})
 
     def _transcribe(self, audio: np.ndarray, beam_size: int, kind: str) -> str:
         start = time.perf_counter()
-        hotwords = self.dictionary.hotwords() if self.dictionary else None
+        hotwords = self.dictionary.hotwords(self.source_language) if self.dictionary else None
         with self.model_lock:
             segments, _ = self.model.transcribe(
                 audio,
@@ -170,14 +165,31 @@ class StreamingTranscriber(threading.Thread):
                 hotwords=hotwords,
             )
         text = "".join(seg.text for seg in segments).strip()
-        cleaned = collapse_repeats(text)
+        cleaned = self._cleanup_text(text)
         if cleaned != text and self.cfg.log_latency:
-            print(f"[asr] 繰り返し幻覚を{'除去' if not cleaned else '圧縮'}: {text[:60]}")
+            print(f"[asr] 幻覚候補を{'除去' if not cleaned else '補正'}: {text[:60]}")
         text = cleaned
         if self.dictionary is not None:
-            text = self.dictionary.apply(text)
+            before_dict = text
+            text = self.dictionary.apply(text, self.source_language)
+            cleaned = self._cleanup_text(text)
+            if cleaned != text and self.cfg.log_latency:
+                print(f"[asr] 辞書適用後の幻覚候補を{'除去' if not cleaned else '補正'}: {text[:60]}")
+            text = cleaned
+            if before_dict != text and not text:
+                last = before_dict[:60]
+                if self.cfg.log_latency and last:
+                    print(f"[asr] 辞書適用後に空になりました: {last}")
         if self.cfg.log_latency:
             elapsed = (time.perf_counter() - start) * 1000
             audio_sec = len(audio) / TARGET_RATE
             print(f"[asr] {kind} {audio_sec:.1f}s -> {elapsed:.0f}ms: {text[:60]}")
         return text
+
+    def _cleanup_text(self, text: str) -> str:
+        return cleanup_asr_text(
+            text,
+            self.source_language,
+            self.cfg.asr_suppressed_phrases,
+            self.cfg.english_asr_reject_cjk,
+        )

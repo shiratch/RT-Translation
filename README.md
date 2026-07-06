@@ -82,9 +82,18 @@ python -m venv .venv
 | `source_language` | 音声認識する言語。英語は `en`、日本語文字起こしは `ja` |
 | `show_source` | 英語原文も字幕上に小さく表示 |
 | `device` | `"cuda"` / `"cpu"`(CUDA 初期化失敗時は自動で CPU フォールバック) |
+| `translation_final_beam_size` | 確定翻訳の探索幅(既定 4)。大きいほど自然になりやすいが遅くなる |
+| `translation_partial_beam_size` | 暫定翻訳の探索幅(既定 1)。反応速度優先 |
+| `translation_repetition_penalty` / `translation_no_repeat_ngram_size` | 確定翻訳の繰り返し抑制 |
+| `translation_buffer_final_fragments` | 短い確定断片を少し結合してから翻訳する(既定 true) |
+| `translation_fragment_flush_seconds` | 断片結合を待つ最大秒数(既定 1.2) |
+| `translation_suppressed_phrases` | 翻訳結果に出たら破棄する hallucination 語句リスト |
+| `translation_reject_short_cjk` | 長い英語入力から短い日本語名詞片だけが出た翻訳を破棄する(既定 true) |
 | `final_lines` | 画面に同時表示する最大行数、折り返し込み(既定 7) |
 | `speaker_change_detection` | 話者交代の検出(既定 true)。false で1確定=1行の表示に |
 | `speaker_change_threshold` | 交代判定の閾値(既定 0.45)。誤検出が多ければ下げ、見逃しが多ければ上げる |
+| `asr_suppressed_phrases` | 無音時に出やすい定型 hallucination を破棄する語句リスト |
+| `english_asr_reject_cjk` | 英語認識中に日本語文字だけが出た結果を破棄する(既定 true) |
 | `transcript_enabled` | 確定字幕をテキストファイルへ保存する(既定 true) |
 | `transcript_path` | 保存先。`{timestamp}` は起動時刻の `YYYYMMDD_HHMMSS` に置換される |
 | `transcript_format` | 保存形式。`both` で英語原文+日本語訳、`en` で原文のみ、`ja` で訳文のみ |
@@ -145,6 +154,9 @@ python -m venv .venv
 
 辞書ファイルは .gitignore 済みなのでリポジトリにはコミットされない。
 別ツールと同じ辞書を共用したい場合は `config.json` で絶対パスを指定する。
+英語認識モードでは、日本語を含む辞書語は ASR の hotwords / 認識直後の置換には使わず、
+翻訳後の日本語テキストへの置換だけに使う。日本語辞書語が英語ASRへ混入して
+誤認識を誘発するのを避けるため。
 
 数字・型番・製品名が誤認識される場合は、辞書に候補語を追加すると認識が寄りやすい。
 例えば `4000番`、`クレスト4000番`、`レガリス6000番` のように 1 行 1 語で書く。
@@ -159,6 +171,10 @@ python -m venv .venv
   → NLLB-200 で英→日翻訳(日本語音声モードでは翻訳を省略)
   → 透過オーバーレイに表示(暫定=グレー、確定=白)
 ```
+
+暫定字幕は反応速度優先で短い断片を翻訳するが、確定時は暫定翻訳を流用しない。
+短い確定断片は最大 1.2 秒だけ前後と結合し、確定した ASR テキスト全体を
+NLLB で beam search して翻訳し直す。
 
 翻訳エンジンは `rt_translator/translator.py` の `Translator` インターフェースを
 実装すれば DeepL / Claude API 等に差し替え可能。

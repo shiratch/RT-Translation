@@ -111,6 +111,7 @@ class SubtitleOverlay:
         self.history.clear()
         self.view_offset = 0
         self._live_partial = ""
+        self._live_partial_change = False
         self._live_source = ""
         self._render()
 
