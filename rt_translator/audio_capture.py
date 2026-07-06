@@ -65,3 +65,63 @@ class LoopbackCapture:
             self._stream.close()
         if self._pa is not None:
             self._pa.terminate()
+
+
+class MicrophoneCapture:
+    def __init__(self, out_queue: queue.Queue, block_seconds: float = 0.1,
+                 device_name: str = ""):
+        self.out_queue = out_queue
+        self.block_seconds = block_seconds
+        self.device_name = device_name
+        self._pa = None
+        self._stream = None
+        self._channels = 1
+        self._rate = 48000
+
+    def start(self):
+        self._pa = pyaudio.PyAudio()
+        device = self._find_input_device()
+        self._rate = int(device["defaultSampleRate"])
+        self._channels = max(1, int(device["maxInputChannels"]))
+        frames = int(self._rate * self.block_seconds)
+        self._stream = self._pa.open(
+            format=pyaudio.paFloat32,
+            channels=self._channels,
+            rate=self._rate,
+            input=True,
+            input_device_index=device["index"],
+            frames_per_buffer=frames,
+            stream_callback=self._callback,
+        )
+        print(f"[mic] キャプチャ開始: {device['name']} "
+              f"({self._rate}Hz, {self._channels}ch -> {TARGET_RATE}Hz mono)")
+
+    def _find_input_device(self) -> dict:
+        if self.device_name:
+            target = self.device_name.lower()
+            for i in range(self._pa.get_device_count()):
+                device = self._pa.get_device_info_by_index(i)
+                if int(device.get("maxInputChannels", 0)) <= 0:
+                    continue
+                if target in device["name"].lower():
+                    return device
+            raise RuntimeError(f"マイク入力デバイスが見つかりません: {self.device_name}")
+        return self._pa.get_default_input_device_info()
+
+    def _callback(self, in_data, frame_count, time_info, status):
+        data = np.frombuffer(in_data, dtype=np.float32)
+        if self._channels > 1:
+            data = data.reshape(-1, self._channels).mean(axis=1)
+        if self._rate != TARGET_RATE:
+            n_out = int(len(data) * TARGET_RATE / self._rate)
+            x_out = np.linspace(0.0, len(data) - 1, n_out)
+            data = np.interp(x_out, np.arange(len(data)), data).astype(np.float32)
+        self.out_queue.put(data)
+        return (None, pyaudio.paContinue)
+
+    def stop(self):
+        if self._stream is not None:
+            self._stream.stop_stream()
+            self._stream.close()
+        if self._pa is not None:
+            self._pa.terminate()
