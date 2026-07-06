@@ -14,7 +14,7 @@ class Config:
     source_language: str = "en"
     partial_interval: float = 0.8       # 発話中に暫定認識を回す間隔 [秒]
     silence_finalize: float = 0.45      # この長さの無音でセグメント確定 [秒]
-    max_utterance: float = 9.0          # 強制確定までの最大発話長 [秒]
+    max_utterance: float = 12.0         # 強制確定までの最大発話長 [秒]
     min_speech: float = 0.30            # VAD上の実発話累計がこれ未満なら無視 [秒]
     asr_min_segment_peak: float = 1e-3  # ほぼ無音の塊をWhisperへ渡さない
     asr_min_segment_rms: float = 0.0    # 相手音声用RMSゲート(0で無効)
@@ -47,7 +47,7 @@ class Config:
     translation_single_pass_max_chars: int = 160
     translation_buffer_final_fragments: bool = True
     translation_fragment_flush_seconds: float = 0.6
-    translation_incomplete_fragment_flush_seconds: float = 2.0
+    translation_incomplete_fragment_flush_seconds: float = 3.0
     translation_deferred_fragment_flush_seconds: float = 4.0
     translation_fragment_max_chars: int = 220
     translation_fragment_max_segments: int = 4

@@ -78,7 +78,7 @@ python -m venv .venv
 |---|---|
 | `partial_interval` | 暫定字幕の更新間隔。小さいほど反応が速いが GPU 負荷増 |
 | `silence_finalize` | この秒数の無音で発話を確定(既定 0.45)。小さいほど確定が速いが文が細切れに |
-| `max_utterance` | 無音がなくてもこの秒数で強制確定(既定 9.0)。小さいほど白文字化が速い |
+| `max_utterance` | 無音がなくてもこの秒数で強制確定(既定 12.0)。小さいほど白文字化が速い |
 | `min_speech` | VAD で実発話と判定された累計秒数がこれ未満なら破棄(既定 0.30) |
 | `whisper_model` | `large-v3-turbo` / `medium.en` / `small.en` など。小さいほど速く精度低下 |
 | `source_language` | 音声認識する言語。英語は `en`、日本語文字起こしは `ja` |
@@ -94,7 +94,7 @@ python -m venv .venv
 | `translation_repetition_penalty` / `translation_no_repeat_ngram_size` | 確定翻訳の繰り返し抑制 |
 | `translation_buffer_final_fragments` | 短い確定断片を少し結合してから翻訳する(既定 true) |
 | `translation_fragment_flush_seconds` | 断片結合を待つ最大秒数(既定 0.6) |
-| `translation_incomplete_fragment_flush_seconds` | ピリオド等で終わっていない断片を待つ最大秒数(既定 2.0) |
+| `translation_incomplete_fragment_flush_seconds` | ピリオド等で終わっていない断片を待つ最大秒数(既定 3.0) |
 | `translation_deferred_fragment_flush_seconds` | 式など文脈待ち断片を待つ最大秒数(既定 4.0) |
 | `translation_defer_formula_fragments` | `Study plus practice` など式っぽい短い断片を次セグメントと結合する(既定 true) |
 | `translation_suppressed_phrases` | 翻訳結果に出たら破棄する hallucination 語句リスト |
