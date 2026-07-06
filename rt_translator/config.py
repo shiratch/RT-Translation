@@ -18,12 +18,37 @@ class Config:
     min_speech: float = 0.25            # これ未満の発話は無視 [秒]
     partial_beam_size: int = 1
     final_beam_size: int = 1
+    asr_suppressed_phrases: list[str] = dataclasses.field(default_factory=lambda: [
+        "栗子",
+        "株式 関値 位置ループ",
+        "ご視聴ありがとうございました",
+        "ご清聴ありがとうございました",
+    ])
+    english_asr_reject_cjk: bool = True  # 英語認識なのに日本語文字だけ出た場合は破棄
 
     # --- 翻訳 ---
     nllb_repo: str = "JustFrederik/nllb-200-distilled-600M-ct2-int8"
     nllb_compute_type: str = "int8_float16"
     target_lang: str = "jpn_Jpan"
     source_lang_nllb: str = "eng_Latn"
+    translation_partial_beam_size: int = 1
+    translation_final_beam_size: int = 4
+    translation_length_penalty: float = 1.0
+    translation_repetition_penalty: float = 1.1
+    translation_no_repeat_ngram_size: int = 3
+    translation_buffer_final_fragments: bool = True
+    translation_fragment_flush_seconds: float = 1.2
+    translation_fragment_max_chars: int = 140
+    translation_fragment_max_segments: int = 3
+    translation_suppressed_phrases: list[str] = dataclasses.field(default_factory=lambda: [
+        "栗子",
+        "株式 関値 位置ループ",
+        "ご視聴ありがとうございました",
+        "ご清聴ありがとうございました",
+    ])
+    translation_reject_short_cjk: bool = True
+    translation_suspicious_source_min_chars: int = 24
+    translation_suspicious_target_max_chars: int = 12
 
     # --- 話者交代検出 ---
     speaker_change_detection: bool = True
