@@ -16,49 +16,25 @@ from faster_whisper.vad import VadOptions, get_speech_timestamps
 
 from .audio_capture import TARGET_RATE
 from .config import Config
-
-
-def collapse_repeats(text: str) -> str:
-    """Whisper の繰り返し幻覚(同じ語句の連呼)を除去する。
-
-    1〜4 語の同一 n-gram が 3 回以上連続していたら 1 回に畳む。
-    畳んだ結果、元テキストの半分以上が繰り返しだった場合は
-    幻覚(音楽・拍手など非発話区間)とみなして全体を破棄する。
-    """
-    tokens = text.split()
-    out = []
-    removed = 0
-    i = 0
-    while i < len(tokens):
-        for n in (4, 3, 2, 1):
-            k = 1
-            while (i + (k + 1) * n <= len(tokens)
-                   and tokens[i:i + n] == tokens[i + k * n:i + (k + 1) * n]):
-                k += 1
-            if k >= 3:
-                out.extend(tokens[i:i + n])
-                removed += (k - 1) * n
-                i += k * n
-                break
-        else:
-            out.append(tokens[i])
-            i += 1
-    if removed > len(tokens) // 2:
-        return ""
-    return " ".join(out) if removed else text
+from .text_cleanup import collapse_repeats
 
 
 class StreamingTranscriber(threading.Thread):
     def __init__(self, cfg: Config, audio_queue: queue.Queue, out_queue: queue.Queue,
-                 stop_event: threading.Event, speaker_detector=None, dictionary=None):
-        super().__init__(daemon=True, name="asr")
+                 stop_event: threading.Event, speaker_detector=None, dictionary=None,
+                 model=None, model_lock=None, source_language: str | None = None,
+                 name: str = "asr", emit_partials: bool = True):
+        super().__init__(daemon=True, name=name)
         self.cfg = cfg
         self.audio_queue = audio_queue
         self.out_queue = out_queue
         self.stop_event = stop_event
         self.speaker_detector = speaker_detector
         self.dictionary = dictionary
-        self.model = self._load_model()
+        self.model = model if model is not None else self._load_model()
+        self.model_lock = model_lock if model_lock is not None else threading.Lock()
+        self.source_language = source_language or cfg.source_language
+        self.emit_partials = emit_partials
         # speech_pad_ms 既定値(400ms)は発話間のポーズを潰して文単位の確定を
         # 妨げるので短くする(セグメント切り出し時に自前で前パディングする)
         self._vad_options = VadOptions(min_silence_duration_ms=250, speech_pad_ms=100)
@@ -160,7 +136,7 @@ class StreamingTranscriber(threading.Thread):
                 self.out_queue.put({"kind": "final", "text": text,
                                     "speaker_change": speaker_change})
                 last_partial_text = ""
-            elif time.monotonic() - last_partial_at >= cfg.partial_interval:
+            elif self.emit_partials and time.monotonic() - last_partial_at >= cfg.partial_interval:
                 speech_end = speech[-1]["end"]
                 if (speech_end - speech_start) / TARGET_RATE < cfg.min_speech:
                     continue
@@ -182,16 +158,17 @@ class StreamingTranscriber(threading.Thread):
     def _transcribe(self, audio: np.ndarray, beam_size: int, kind: str) -> str:
         start = time.perf_counter()
         hotwords = self.dictionary.hotwords() if self.dictionary else None
-        segments, _ = self.model.transcribe(
-            audio,
-            language=self.cfg.source_language,
-            beam_size=beam_size,
-            # 圧縮率チェックに失敗したセグメントは温度を上げて再試行させる
-            temperature=[0.0, 0.2, 0.4],
-            condition_on_previous_text=False,
-            without_timestamps=True,
-            hotwords=hotwords,
-        )
+        with self.model_lock:
+            segments, _ = self.model.transcribe(
+                audio,
+                language=self.source_language,
+                beam_size=beam_size,
+                # 圧縮率チェックに失敗したセグメントは温度を上げて再試行させる
+                temperature=[0.0, 0.2, 0.4],
+                condition_on_previous_text=False,
+                without_timestamps=True,
+                hotwords=hotwords,
+            )
         text = "".join(seg.text for seg in segments).strip()
         cleaned = collapse_repeats(text)
         if cleaned != text and self.cfg.log_latency:
