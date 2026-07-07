@@ -10,6 +10,7 @@ class Config:
     # --- ASR ---
     whisper_model: str = "large-v3-turbo"
     device: str = "cuda"                # "cuda" / "cpu"(自動フォールバックあり)
+    device_index: int = 0               # CUDA device index used by faster-whisper/CTranslate2
     whisper_compute_type: str = "int8_float16"
     source_language: str = "en"
     partial_interval: float = 0.8       # 発話中に暫定認識を回す間隔 [秒]
@@ -99,6 +100,17 @@ class Config:
     mic_transcript_label: str = "MIC"
     mic_dictionary_hotwords: bool = False  # 無音時に辞書語へ寄りすぎるのを避ける
     mic_min_segment_rms: float = 0.015  # マイク無音/環境音からの幻覚を抑える
+    mic_asr_suppressed_phrases: list[str] = dataclasses.field(default_factory=lambda: [
+        "ありがとうございました",
+        "ご視聴ありがとうございました",
+        "ご視聴ありがとうございます",
+        "ではご視聴ありがとうございました",
+        "またご視聴ありがとうございました",
+        "次はご視聴ありがとうございました",
+        "次回の動画でお会いしましょう",
+        "また会いましょう",
+    ])
+    mic_asr_suppressed_substring_max_chars: int = 28
 
     # --- その他 ---
     log_latency: bool = True            # 各段の処理時間をコンソールに出す
