@@ -90,7 +90,9 @@ def main():
                 model=asr.model, model_lock=asr.model_lock,
                 source_language=mic_source_language, name="asr-mic",
                 use_hotwords=cfg.mic_dictionary_hotwords,
-                min_segment_rms=cfg.mic_min_segment_rms)
+                min_segment_rms=cfg.mic_min_segment_rms,
+                suppressed_phrases=cfg.mic_asr_suppressed_phrases,
+                suppressed_substring_max_chars=cfg.mic_asr_suppressed_substring_max_chars)
             mic_writer = TranscriptOnlyWorker(
                 cfg, mic_text_queue, stop_event, transcript_writer,
                 mic_source_language, cfg.mic_transcript_label)
