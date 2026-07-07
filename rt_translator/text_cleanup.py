@@ -44,7 +44,34 @@ _SUPPRESSED_SUBSTRING_SEEDS = {
     "栗子",
     "株式関値位置ループ",
     "株式閾値位置ループ",
+    "ありがとうございました",
+    "ご視聴ありがとうございました",
+    "ご視聴ありがとうございます",
+    "次回の動画でお会いしましょう",
 }
+
+_MEETING_TERM_REPLACEMENTS = (
+    ("積分テスト", "統合テスト"),
+    ("遠隔センサー", "距離センサー"),
+    ("メールセンサー", "照度センサー"),
+    ("輸出", "エクスポート"),
+    ("単一の標本", "1台あたり"),
+    ("コストの費用", "コスト"),
+    ("MVMP の体", "MVMP のボディ"),
+    ("MVMPの体", "MVMPのボディ"),
+)
+
+_MEETING_TONE_REPLACEMENTS = (
+    ("教えて下さい", "教えてください"),
+    ("分かってる", "分かりました"),
+    ("わかった", "分かりました"),
+    ("ワオ", "なるほど"),
+    ("そうだ", "そうです"),
+    ("大丈夫だ", "大丈夫です"),
+    ("問題ない", "問題ありません"),
+    ("聞こえるか", "聞こえますか"),
+    ("ミムミム", "はい"),
+)
 
 
 def _is_mostly_repetition(text_len: int, removed: int, min_len: int) -> bool:
@@ -241,6 +268,59 @@ def repair_translation_numbers(text: str, source_text: str,
         if count == 0:
             break
     return repaired
+
+
+def _contains_any(text: str, words: tuple[str, ...]) -> bool:
+    return any(word in text for word in words)
+
+
+def _apply_meeting_tone_replacements(text: str) -> str:
+    for wrong, correct in _MEETING_TONE_REPLACEMENTS:
+        text = text.replace(wrong, correct)
+    return text.replace("お前", "あなた")
+
+
+def apply_meeting_translation_fixes(text: str, source_text: str,
+                                    source_language: str) -> str:
+    """会議字幕向けに、NLLBが崩しやすい技術語と強い口調を補正する。"""
+    if not text or not _is_english_source_language(source_language):
+        return text
+
+    source = source_text.lower()
+    if ("don't get any more questions" in source
+            or "do not get any more questions" in source):
+        return "他に質問はありませんか？"
+
+    for wrong, correct in _MEETING_TERM_REPLACEMENTS:
+        text = text.replace(wrong, correct)
+
+    if ("facebook" in source
+            and _contains_any(source, ("schedule", "milestone", "phase"))):
+        text = text.replace("Facebook", "フェーズ2")
+
+    if ("bug" in source
+            or ("bag" in source and _contains_any(source, ("fix", "upgrade")))):
+        text = text.replace("バッグ", "バグ")
+
+    if "foam" in source and "camera" in source:
+        text = text.replace("泡が必要", "4つのカメラが必要")
+        text = text.replace("泡", "4つのカメラ")
+        text = text.replace("全カメラ", "4つのカメラ")
+
+    if "math" in source:
+        text = text.replace("数学", "計算")
+
+    if "back to you" in source:
+        text = text.replace("お前に返信できるかもしれません", "後で回答できるかもしれません")
+        text = text.replace("お前に返信", "後で回答")
+        text = text.replace("あなたに返信できるかもしれません", "後で回答できるかもしれません")
+        text = text.replace("あなたに返信", "後で回答")
+
+    if "space to like open" in source or "space to open" in source:
+        text = text.replace("スイートなどの空間", "スリットや開口部")
+        text = text.replace("透明な素材や スイートなどの空間", "透明素材やスリット、開口部")
+
+    return _apply_meeting_tone_replacements(text)
 
 
 def normalize_japanese_punctuation(text: str, final: bool = False) -> str:

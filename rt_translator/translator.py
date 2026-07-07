@@ -10,7 +10,9 @@ import threading
 import time
 
 from .config import Config
-from .text_cleanup import (cleanup_translation_text, normalize_japanese_punctuation,
+from .text_cleanup import (apply_meeting_translation_fixes,
+                           cleanup_translation_text,
+                           normalize_japanese_punctuation,
                            repair_translation_numbers)
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
@@ -50,8 +52,9 @@ class NllbCT2Translator(Translator):
             model_dir, src_lang=cfg.source_lang_nllb)
         try:
             self.model = ctranslate2.Translator(
-                model_dir, device=cfg.device, compute_type=cfg.nllb_compute_type)
-            print(f"[mt] NLLB を {cfg.device} でロードしました")
+                model_dir, device=cfg.device, device_index=cfg.device_index,
+                compute_type=cfg.nllb_compute_type)
+            print(f"[mt] NLLB を {cfg.device}:{cfg.device_index} でロードしました")
         except Exception as exc:
             if cfg.device == "cuda":
                 print(f"[mt] CUDA でのロードに失敗、CPU にフォールバックします: {exc}")
@@ -351,6 +354,8 @@ class TranslationWorker(threading.Thread):
                 transcript_ja_label=self.cfg.transcript_rejected_translation_label,
             )
             return
+        japanese = apply_meeting_translation_fixes(
+            japanese, entry["text"], self.cfg.source_language)
         if self.cfg.log_latency:
             elapsed = (time.perf_counter() - start) * 1000
             source_preview = entry["text"][:60]
