@@ -25,7 +25,9 @@ class StreamingTranscriber(threading.Thread):
                  model=None, model_lock=None, source_language: str | None = None,
                  name: str = "asr", emit_partials: bool = True,
                  use_hotwords: bool = True,
-                 min_segment_rms: float | None = None):
+                 min_segment_rms: float | None = None,
+                 suppressed_phrases: list[str] | None = None,
+                 suppressed_substring_max_chars: int | None = None):
         super().__init__(daemon=True, name=name)
         self.cfg = cfg
         self.audio_queue = audio_queue
@@ -39,6 +41,8 @@ class StreamingTranscriber(threading.Thread):
         self.emit_partials = emit_partials
         self.use_hotwords = use_hotwords
         self.min_segment_rms = min_segment_rms
+        self.suppressed_phrases = suppressed_phrases
+        self.suppressed_substring_max_chars = suppressed_substring_max_chars
         # speech_pad_ms 既定値(400ms)は発話間のポーズを潰して文単位の確定を
         # 妨げるので短くする(セグメント切り出し時に自前で前パディングする)
         self._vad_options = VadOptions(min_silence_duration_ms=250, speech_pad_ms=100)
@@ -47,8 +51,10 @@ class StreamingTranscriber(threading.Thread):
         cfg = self.cfg
         try:
             model = WhisperModel(cfg.whisper_model, device=cfg.device,
+                                 device_index=cfg.device_index,
                                  compute_type=cfg.whisper_compute_type)
-            print(f"[asr] Whisper '{cfg.whisper_model}' を {cfg.device} でロードしました")
+            print(f"[asr] Whisper '{cfg.whisper_model}' を "
+                  f"{cfg.device}:{cfg.device_index} でロードしました")
             return model
         except Exception as exc:
             if cfg.device == "cuda":
@@ -259,7 +265,9 @@ class StreamingTranscriber(threading.Thread):
         return cleanup_asr_text(
             text,
             self.source_language,
-            self.cfg.asr_suppressed_phrases,
+            self.suppressed_phrases or self.cfg.asr_suppressed_phrases,
             self.cfg.english_asr_reject_cjk,
-            self.cfg.asr_suppressed_substring_max_chars,
+            (self.suppressed_substring_max_chars
+             if self.suppressed_substring_max_chars is not None
+             else self.cfg.asr_suppressed_substring_max_chars),
         )

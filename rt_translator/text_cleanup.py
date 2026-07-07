@@ -44,7 +44,25 @@ _SUPPRESSED_SUBSTRING_SEEDS = {
     "栗子",
     "株式関値位置ループ",
     "株式閾値位置ループ",
+    "ありがとうございました",
+    "ご視聴ありがとうございました",
+    "ご視聴ありがとうございます",
+    "次回の動画でお会いしましょう",
 }
+
+_MEETING_TERM_REPLACEMENTS = ()
+
+_MEETING_TONE_REPLACEMENTS = (
+    ("教えて下さい", "教えてください"),
+    ("分かってる", "分かりました"),
+    ("わかった", "分かりました"),
+    ("ワオ", "なるほど"),
+    ("そうだ", "そうです"),
+    ("大丈夫だ", "大丈夫です"),
+    ("問題ない", "問題ありません"),
+    ("聞こえるか", "聞こえますか"),
+    ("ミムミム", "はい"),
+)
 
 
 def _is_mostly_repetition(text_len: int, removed: int, min_len: int) -> bool:
@@ -241,6 +259,28 @@ def repair_translation_numbers(text: str, source_text: str,
         if count == 0:
             break
     return repaired
+
+
+def _contains_any(text: str, words: tuple[str, ...]) -> bool:
+    return any(word in text for word in words)
+
+
+def _apply_meeting_tone_replacements(text: str) -> str:
+    for wrong, correct in _MEETING_TONE_REPLACEMENTS:
+        text = text.replace(wrong, correct)
+    return text.replace("お前", "あなた")
+
+
+def apply_meeting_translation_fixes(text: str, source_text: str,
+                                    source_language: str) -> str:
+    """会議字幕向けに、NLLBが崩しやすい技術語と強い口調を補正する。"""
+    if not text or not _is_english_source_language(source_language):
+        return text
+
+    for wrong, correct in _MEETING_TERM_REPLACEMENTS:
+        text = text.replace(wrong, correct)
+
+    return _apply_meeting_tone_replacements(text)
 
 
 def normalize_japanese_punctuation(text: str, final: bool = False) -> str:
