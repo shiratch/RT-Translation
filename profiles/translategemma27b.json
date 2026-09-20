@@ -1,0 +1,22 @@
+{
+  "device": "cuda",
+  "whisper_model": "large-v3-turbo",
+  "whisper_compute_type": "float16",
+  "whisper_num_workers": 2,
+  "asr_bilingual": true,
+  "partial_interval": 0.4,
+  "partial_beam_size": 1,
+  "partial_temperature_fallback": false,
+  "final_beam_size": 5,
+  "translation_backend": "translategemma",
+  "gemma_model": "27b-q6_k",
+  "gemma_model_path": "",
+  "translation_partial_full_context": true,
+  "translation_stream_preview": true,
+  "translation_meeting_fixes": false,
+  "translation_repair_numbers": false,
+  "translation_final_beam_size": 1,
+  "translation_max_decoding_length": 256,
+  "translation_incomplete_fragment_flush_seconds": 1.0,
+  "translation_deferred_fragment_flush_seconds": 1.5
+}

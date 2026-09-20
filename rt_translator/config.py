@@ -12,7 +12,10 @@ class Config:
     device: str = "cuda"                # "cuda" / "cpu"(自動フォールバックあり)
     device_index: int = 0               # CUDA device index used by faster-whisper/CTranslate2
     whisper_compute_type: str = "int8_float16"
+    whisper_num_workers: int = 1        # マイクと相手音声を同時実行する推論ワーカー数
+    whisper_flash_attention: bool = False
     source_language: str = "en"
+    asr_bilingual: bool = False         # 英語モードの相手音声を発話ごとに日英判定
     partial_interval: float = 0.8       # 発話中に暫定認識を回す間隔 [秒]
     silence_finalize: float = 0.45      # この長さの無音でセグメント確定 [秒]
     max_utterance: float = 12.0         # 強制確定までの最大発話長 [秒]
@@ -20,6 +23,7 @@ class Config:
     asr_min_segment_peak: float = 1e-3  # ほぼ無音の塊をWhisperへ渡さない
     asr_min_segment_rms: float = 0.0    # 相手音声用RMSゲート(0で無効)
     partial_beam_size: int = 1
+    partial_temperature_fallback: bool = True  # 暫定認識で温度を変えた再試行を許可
     final_beam_size: int = 1
     asr_suppressed_phrases: list[str] = dataclasses.field(default_factory=lambda: [
         "Amazon",
@@ -33,7 +37,23 @@ class Config:
     english_asr_reject_cjk: bool = True  # 英語認識なのに日本語文字だけ出た場合は破棄
 
     # --- 翻訳 ---
+    translation_backend: str = "nllb"   # nllb / translategemma / hymt2
+    translation_partial_full_context: bool = False
+    translation_stream_preview: bool = False  # 生成中の訳をグレー字幕へ順次表示
+    translation_meeting_fixes: bool = True
+    translation_repair_numbers: bool = True
+    gemma_model: str = "12b-q8_0"      # 12b-q8_0 / 27b-q6_k（固定リビジョン）
+    gemma_model_path: str = ""         # 空ならgemma_modelのモデルを自動取得
+    gemma_server_path: str = ""        # 空なら公式llama.cppを自動取得
+    gemma_context_size: int = 2048
+    gemma_startup_timeout: float = 300.0
+    gemma_request_timeout: float = 30.0
+    hymt_model_path: str = ""          # 空ならTencent公式30B-A3B Q4_K_Mを取得
+    hymt_server_path: str = ""         # 空なら共通のllama.cppを使用
+    hymt_context_size: int = 2048
+    hymt_temperature: float = 0.0      # 字幕比較の再現性を優先（公式推奨は0.7）
     nllb_repo: str = "JustFrederik/nllb-200-distilled-1.3B-ct2-int8"
+    nllb_cache_dir: str = ""            # 空なら Hugging Face の既定キャッシュ
     nllb_compute_type: str = "int8_float16"
     target_lang: str = "jpn_Jpan"
     source_lang_nllb: str = "eng_Latn"
@@ -74,6 +94,7 @@ class Config:
     # --- オーバーレイ表示 ---
     font_family: str = "Yu Gothic UI"
     font_size: int = 18
+    latest_final_color: str = "#B5E853"  # 最新の確定結果全体: ライムグリーン
     overlay_alpha: float = 0.85
     overlay_width_ratio: float = 0.6    # 画面幅に対する字幕帯の幅
     final_lines: int = 7                # 画面に同時表示する最大行数(折り返し込み)
@@ -199,12 +220,21 @@ def _apply_env_aliases(cfg: Config):
         print(f"[config] VOICE_STREAM_SILENCE_THRESHOLD を無視: {threshold}")
 
 
-def load_config() -> Config:
+def load_config(profile: str | None = None) -> Config:
     cfg = Config()
     path = Path("config.json")
     if path.exists():
         data = json.loads(path.read_text(encoding="utf-8"))
         _apply_values(cfg, data, str(path))
+    # 明示指定したプロファイルだけを追加適用。個人用 config.json は変更しない。
+    profile = profile if profile is not None else os.environ.get("RT_TRANSLATOR_PROFILE", "")
+    if profile:
+        profile_path = Path(profile)
+        if not profile_path.is_file():
+            profile_path = Path(__file__).resolve().parent.parent / "profiles" / f"{profile}.json"
+        data = json.loads(profile_path.read_text(encoding="utf-8"))
+        _apply_values(cfg, data, str(profile_path))
+        print(f"[config] 性能プロファイル: {profile_path}")
     _apply_launch_mode(cfg)
     _apply_env_aliases(cfg)
     _apply_hallucinations_file(cfg)

@@ -4,3 +4,28 @@ __pycache__/
 config.json
 user_dictionary.txt
 transcripts/
+.model-cache/
+benchmark-results/
+.runtime/
+
+# Local shortcuts can embed absolute paths and machine/user information.
+*.lnk
+*.url
+
+# Private credentials, runtime logs, and recordings.
+.env
+.env.*
+!.env.example
+*.log
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.mp4
+*.webm
+
+# Downloaded model weights, including files placed outside the cache.
+*.gguf
+*.safetensors
+*.onnx

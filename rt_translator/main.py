@@ -41,7 +41,7 @@ def main():
     from .config import load_config
     from .overlay import SubtitleOverlay
     from .transcript import TranscriptOnlyWorker, TranscriptWriter
-    from .translator import (NllbCT2Translator, TranslationWorker,
+    from .translator import (create_translator, TranslationWorker,
                              is_japanese_source_language)
 
     cfg = load_config()
@@ -61,7 +61,7 @@ def main():
         print("[mt] 日本語音声の文字起こしモード: 翻訳モデルはロードしません")
         translator = None
     else:
-        translator = NllbCT2Translator(cfg)
+        translator = create_translator(cfg)
     speaker_detector = None
     if cfg.speaker_change_detection:
         from .speaker import SpeakerChangeDetector
@@ -89,6 +89,7 @@ def main():
                 speaker_detector=None, dictionary=dictionary,
                 model=asr.model, model_lock=asr.model_lock,
                 source_language=mic_source_language, name="asr-mic",
+                emit_partials=False,
                 use_hotwords=cfg.mic_dictionary_hotwords,
                 min_segment_rms=cfg.mic_min_segment_rms,
                 suppressed_phrases=cfg.mic_asr_suppressed_phrases,
@@ -106,6 +107,8 @@ def main():
                 mic_capture = None
 
     language_label = _source_language_label(cfg.source_language, is_japanese_source_language)
+    if cfg.asr_bilingual and cfg.source_language == "en":
+        language_label = "英語・日本語音声（英語は翻訳、日本語は文字起こし）"
     print(f"=== 準備完了。{language_label}を再生すると字幕が表示されます(字幕右クリックで終了) ===")
     overlay = SubtitleOverlay(cfg, ui_queue, stop_event)
     try:
@@ -121,6 +124,8 @@ def main():
         mt.join(timeout=cfg.shutdown_drain_seconds + 5.0)
         if mic_writer is not None:
             mic_writer.join(timeout=cfg.shutdown_drain_seconds + 1.0)
+        if translator is not None:
+            translator.close()
 
 
 if __name__ == "__main__":

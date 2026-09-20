@@ -8,7 +8,8 @@ Google Meet などのリモート会議で、相手の英語音声をリアル�
 - 翻訳: NLLB-200-distilled-1.3B(CTranslate2 int8, GPU)
 - 音声取得: WASAPI ループバック — **マイクや仮想オーディオデバイスの設定は不要**。
   スピーカーに出ている音をそのまま拾う
-- 体感遅延: 発話から暫定字幕(グレー)まで 1〜1.5 秒、確定字幕(白)は無音検出後
+- 体感遅延: 発話から暫定字幕(グレー)まで 1〜1.5 秒、確定字幕は無音検出後
+- 最新の確定結果は全文ライムグリーン。複数文でもまとめて色付けし、次の結果が確定すると前の結果は白に戻る
 
 ## 必要環境
 
@@ -57,6 +58,181 @@ python -m venv .venv
 
 ## 設定
 
+### RTX 5090向け・バランス設定
+
+`run_5090_ja.bat`（日本語文字起こし）または `run_5090_en.bat`（英語→日本語）を
+実行する。既存の起動ファイルと `config.json` はそのまま使える。
+この設定では `profiles/rtx5090.json` を `config.json` の後に重ね、最後に起動モードを適用する。
+フォント、辞書、マイクデバイスなどの個人設定は引き継ぐ。
+
+| 項目 | 従来の既定値 | RTX 5090設定 |
+|---|---|---|
+| 音声認識 | Whisper large-v3-turbo / INT8混合 | 同じモデル / FP16 |
+| 暫定 / 確定の探索幅 | 1 / 1 | 1 / 5 |
+| 暫定字幕の更新間隔 | 0.8秒 | 0.6秒 |
+| 相手音声とマイクの推論 | 1ワーカー | 2ワーカー（同じモデルを共有） |
+| 翻訳モデル | NLLB 1.3B | NLLB 3.3B |
+| 翻訳の計算形式 | INT8混合 | FP16 |
+| 句点のない確定断片の待ち時間 | 3秒 | 1秒 |
+| 式などの文脈待ち時間 | 4秒 | 1.5秒 |
+
+マイク側はどちらの設定でも確定認識だけを行う。字幕に使わない暫定認識を省き、
+相手音声とGPUを取り合う機会を減らした。日本語モードでは翻訳モデルをロードしない。
+Flash Attentionは既定では無効。
+
+5090版は CTranslate2 4.8.2 / faster-whisper 1.2.1 / CUDA 12.9系のpip DLLで検証した。
+古い仮想環境を使う場合は、最初に次を実行する（通常の起動ファイルは依存更新を自動実行しない）。
+
+```powershell
+.venv\Scripts\python -m pip install -r requirements-rtx5090.txt
+```
+
+新規環境では `run.bat` で環境を作成してから上記を実行する。
+NLLB 3.3Bは初回にダウンロードし、プロジェクト内の `.model-cache/` に保存する。
+取得する重みはINT8変換済みのため、FP16で実行しても量子化前の重みの精度には戻らない。
+狙いは5090上での処理速度と、大きい翻訳モデル・広い確定探索を両立させること。
+元の設定へ戻すときは `run_ja.bat` / `run_en.bat` を使う。
+
+#### 保存音声での性能比較
+
+```powershell
+.venv\Scripts\python -m rt_translator.benchmark --audio sample.wav --language en --output benchmark-results/default.json
+.venv\Scripts\python -m rt_translator.benchmark --audio sample.wav --language en --profile rtx5090 --output benchmark-results/rtx5090.json
+```
+
+WAV以外にもfaster-whisperが読める音声ファイルを指定できる。`--language ja` では翻訳測定を省く。
+マイク・ループバック・字幕画面は起動せず、ウォームアップ1回の後、各処理を3回測る。
+`--repeats` で回数を変えられる。モデルは通常と同様、未取得ならダウンロードする。
+結果には実際の実行デバイス・計算形式・認識/翻訳文を含める。
+
+2026-09-20、RTX 5090 / ドライバ616.92、Microsoft Ziraで作った約9.9秒の英語音声1件での
+中央値は次のとおり。両方とも同じ5090で測定し、従来設定側にも共通のバグ修正を適用している。
+
+| 単体処理 | 従来設定 | 5090設定 |
+|---|---:|---:|
+| 暫定認識 | 124ms | 86ms |
+| 確定認識 | 138ms | 90ms |
+| 暫定翻訳 | 136ms | 140ms |
+| 確定翻訳 | 267ms | 276ms |
+
+翻訳入力は固定の英語2文。これは少数の合成音声による動作・速度の目安で、
+実会議での精度向上や字幕全体の遅延を保証する値ではない。
+音声認識の終了を待つ時間、VAD、翻訳断片の結合待ち、同時発話の負荷は別に掛かる。
+今回の認識結果は両設定で単語が一致したが、5090版の確定結果では句点が少なかったため、
+句点待ちの上限も短くした。実会議で途切れが気になる場合はプロファイルで待ち時間を調整する。
+
+GPUランタイムの対応状況は [CTranslate2変更履歴](https://github.com/OpenNMT/CTranslate2/blob/master/CHANGELOG.md)、
+複数ワーカーの挙動は [faster-whisper実装・引数説明](https://github.com/SYSTRAN/faster-whisper/blob/master/faster_whisper/transcribe.py)
+を参照。レビュー内容と残る注意点は [REVIEW.md](REVIEW.md) にまとめた。
+
+### TranslateGemma 12B版（英語→日本語）
+
+**`01-会議翻訳文字起こし_TranslateGemma12B.bat` をダブルクリックする。** Whisperは5090向けのTurbo FP16を使い、
+翻訳をTranslateGemma 12B Q8_0へ切り替える。日本語のマイク音声は従来どおり文字起こし保存のみ。
+相手音声は発話ごとに日英を判定し、英語は翻訳、日本語はそのまま字幕に表示・保存する。
+言語判定のために音声を追加で待つ処理は入れず、認識と同じGPU計算結果を再利用する。
+5090 / Gemma 27B / Hy-MT2の英語用起動ファイルでも有効。[日英切り替えの仕様・実測](BILINGUAL.md)。
+NLLB版に戻す場合はアプリを終了し、`run_5090_en.bat` を起動する。
+日本語の文字起こしには引き続き `run_5090_ja.bat` を使う。
+
+`profiles/translategemma12b.json` を追加適用するため、個人用 `config.json` の編集は不要。
+初回はモデル約12.6GBと実行環境約0.54GBを取得する。展開後の実行環境も含めてディスク容量に余裕を確保する。
+このPCでは取得と実機検証を完了している。新規環境でモデルだけ先に準備する場合:
+
+```powershell
+.venv\Scripts\python -m rt_translator.gemma_setup
+```
+
+使用するもの:
+
+- [Google TranslateGemma 12B](https://huggingface.co/google/translategemma-12b-it) の
+  [mradermacherによるQ8_0変換版](https://huggingface.co/mradermacher/translategemma-12b-it-GGUF)。
+  モデルのリビジョンを固定し、`.model-cache/` に保存する。ライセンスは[Gemma利用条件](https://ai.google.dev/gemma/terms)。
+- [公式llama.cpp b10964](https://github.com/ggml-org/llama.cpp/releases/tag/b10964) のWindows x64 CUDA 13.3版。
+  ZIPのSHA256を確認して `.runtime/` に展開する。CUDA ToolkitやPyTorchの追加インストールは不要。
+  RTX 5090、ドライバ616.92で検証済み。
+- 英日翻訳専用のテンプレート。モデル付属テンプレートの英日指示文を維持し、llama.cppが受け取る
+  文字列形式に合わせた。コンテキストはモデルカードに合わせて2048トークン。
+
+アプリが自分専用の `llama-server` を起動し、通常終了時に停止する。
+接続は `127.0.0.1` の空きポートのみで、起動ごとに認証キーを作る。
+モデル取得後の音声認識・翻訳処理はローカルで行う。
+他のllama.cppやOllamaのプロセスは使用・停止しない。
+ロード失敗時の診断ログは `.runtime/logs/` に残る。
+
+このプロファイルでは暫定認識を0.4秒間隔とし、翻訳は文を細かく分割せず、一度の入力で文脈を渡す。
+訳文の生成完了を待たず、生成中の訳をグレー字幕へ順次表示する。
+更新時は表示済みの訳が数文字へ戻らないようにし、生成途中の描画は最大約12回/秒に抑える。
+暫定認識では温度を変える再試行を省き、次の音声を待って再認識する。確定認識のbeam 5と再試行は維持する。
+生成は `temperature=0`。NLLB用のbeam幅・反復ペナルティはGemmaには適用しない。
+会議固有の用語置換と、訳文の金額を位置順に上書きする補正を無効にしている。
+ユーザー辞書と共通の繰り返し抑制は引き続き適用する。
+生成上限で途中終了した翻訳は確定訳として出さず、元の英語は議事録に残す。生成途中のグレー字幕は議事録へ保存しない。
+
+2026-09-20の実機検証では、前節と同じ英語2文の翻訳が約300ms（3回の中央値）。
+NLLB 3.3Bの約276msに対して約24ms増だった。別の会議例文8件では各3回の中央値が189〜407ms。
+Whisperとの同時推論も成功し、推論後のGPU全体の使用量は18526MiB（約18.1GiB、デスクトップ等も含む）。
+通常の終了処理で所有サーバーが停止することも確認した。
+
+```powershell
+.venv\Scripts\python -m rt_translator.benchmark --audio sample.wav --language en --profile translategemma12b --output benchmark-results/translategemma12b.json
+```
+
+これらは保存音声と固定文章による検証で、実会議の字幕遅延や翻訳精度を保証するものではない。
+長時間の実会議での安定性・マイクとオーバーレイの動作確認は別途必要。
+結果の例は [TRANSLATEGEMMA.md](TRANSLATEGEMMA.md) を参照。
+
+### TranslateGemma 27B版（英語→日本語）
+
+**`run_gemma27b_en.bat` をダブルクリックする。**
+`profiles/translategemma27b.json` で翻訳を27B Q6_Kへ切り替える。
+12B版に戻す場合はアプリを終了し、`01-会議翻訳文字起こし_TranslateGemma12B.bat` を起動する。
+暫定認識の0.4秒間隔、生成途中のグレー表示、確定認識のbeam 5は12B版と共通。
+
+[Google TranslateGemma 27B](https://huggingface.co/google/translategemma-27b-it) の
+[mradermacherによるQ6_K変換版](https://huggingface.co/mradermacher/translategemma-27b-it-GGUF) を使用する。
+モデルは約22.2GB（20.6GiB）、リビジョンは `0f2c24b456631d519a919e20429119bbd524d86e` に固定。
+12Bのモデルとは別に保存し、llama.cppの実行環境を共用する。
+RTX 5090の32GBでWhisperも併用するためQ6_Kを選択した。
+このPCでは取得・全63層のGPU配置・音声認識2本との同時実行を確認済み。
+GPU全体で約27.3GiBを使用した。例文8件の翻訳完了時間の中央値は約374ms（12Bは約276ms）。
+同時に起動する字幕アプリは1つにする。モデルだけ先に取得する場合:
+
+```powershell
+.venv\Scripts\python -m rt_translator.gemma_setup --model 27b-q6_k
+```
+
+モデルの選択は `gemma_model`（`12b-q8_0` / `27b-q6_k`）で行い、起動時にモデル名と量子化形式を表示する。
+27Bプロファイルでは個人設定の `gemma_model_path` を空に戻し、指定した27Bモデルを選ぶ。
+元のモデル付属翻訳テンプレートが12Bと同一であることを確認し、同じ英日テンプレートを使用する。
+速度・メモリ・訳文の比較は [TRANSLATEGEMMA.md](TRANSLATEGEMMA.md) を参照。
+
+### Hy-MT2 30B-A3B版（英語→日本語）
+
+**`run_hymt_en.bat` をダブルクリックする。**
+`profiles/hymt2.json` を追加適用し、[Tencent公式Q4_K_M版](https://huggingface.co/tencent/Hy-MT2-30B-A3B-GGUF) を使う。
+モデルは約18.2GBで、このPCでは取得・全49層のGPU配置・音声認識2本との同時実行を確認済み。
+既存のllama.cppを共用し、モデル付属テンプレートと英日翻訳の公式指示文を使う。
+
+暫定認識の0.4秒間隔、生成途中のグレー表示はGemma版と共通。
+最新の確定結果は、複数文を含んでも全文ライムグリーンで表示する。
+2026-09-20の例文8件では翻訳完了の中央値が約111ms（Gemma 12Bは約276ms、27Bは約374ms）。
+合成音声で最初のグレー字幕が出るまでの時間は約0.60〜0.68秒で、初回表示は認識待ちも含む。
+GPU全体の使用量は約23.0GiB。詳しい条件・訳文比較は [HY_MT2.md](HY_MT2.md) を参照。
+
+字幕の揺れを抑えるため `hymt_temperature=0` を使用（公式推奨は0.7）。
+Gemma版へ戻す場合はアプリを終了し、`01-会議翻訳文字起こし_TranslateGemma12B.bat` または `run_gemma27b_en.bat` を起動する。
+モデルだけ先に取得する場合:
+
+```powershell
+.venv\Scripts\python -m rt_translator.gemma_setup --model hymt2-30b-a3b-q4_k_m
+```
+
+日本語音声の文字起こしには、引き続き `run_5090_ja.bat` を使用する。
+Hy-MT2は音声認識モデルではなく、認識されたテキストの翻訳に使う。
+
+### 共通設定
+
 プロジェクト直下に `config.json` を置くと既定値を上書きできる。
 ただし `run_ja.bat` / `run_en.bat` で起動した場合は、そのモードが
 `source_language` / 入力元別の議事録保存形式 / `mic_source_language` を上書きする。
@@ -78,7 +254,7 @@ python -m venv .venv
 |---|---|
 | `partial_interval` | 暫定字幕の更新間隔。小さいほど反応が速いが GPU 負荷増 |
 | `silence_finalize` | この秒数の無音で発話を確定(既定 0.45)。小さいほど確定が速いが文が細切れに |
-| `max_utterance` | 無音がなくてもこの秒数で強制確定(既定 12.0)。小さいほど白文字化が速い |
+| `max_utterance` | 無音がなくてもこの秒数で強制確定(既定 12.0)。小さいほど字幕の確定が速い |
 | `min_speech` | VAD で実発話と判定された累計秒数がこれ未満なら破棄(既定 0.30) |
 | `whisper_model` | `large-v3-turbo` / `medium.en` / `small.en` など。小さいほど速く精度低下 |
 | `source_language` | 音声認識する言語。英語は `en`、日本語文字起こしは `ja` |
@@ -100,6 +276,7 @@ python -m venv .venv
 | `translation_suppressed_phrases` | 翻訳結果に出たら破棄する hallucination 語句リスト |
 | `translation_reject_short_cjk` | 長い英語入力から短い日本語名詞片だけが出た翻訳を破棄する(既定 true) |
 | `final_lines` | 画面に同時表示する最大行数、折り返し込み(既定 7) |
+| `latest_final_color` | 最新の確定結果全体の文字色(既定 `#B5E853`、ライムグリーン)。日本語文字起こしでも共通 |
 | `speaker_change_detection` | 話者交代の検出(既定 true)。false で1確定=1行の表示に |
 | `speaker_change_threshold` | 交代判定の閾値(既定 0.45)。誤検出が多ければ下げ、見逃しが多ければ上げる |
 | `asr_suppressed_phrases` | 無音時に出やすい定型 hallucination を破棄する語句リスト |
@@ -201,7 +378,7 @@ ASR と翻訳結果の両方の抑制リストへ追加される。
   → Silero VAD で発話区間管理
   → faster-whisper で 0.8 秒ごとに暫定認識 / 無音で確定認識
   → NLLB-200 で英→日翻訳(日本語音声モードでは翻訳を省略)
-  → 透過オーバーレイに表示(暫定=グレー、確定=白)
+  → 透過オーバーレイに表示(暫定=グレー、最新の確定結果全体=ライムグリーン、過去の確定=白)
 ```
 
 暫定字幕は反応速度優先で短い断片を翻訳するが、確定時は暫定翻訳を流用しない。

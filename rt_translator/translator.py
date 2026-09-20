@@ -30,6 +30,16 @@ def is_japanese_source_language(language: str) -> bool:
 
 
 class Translator:
+    def translate_stream(self, text: str, **kwargs):
+        """非ストリーム対応エンジンでは完成した訳を1回返す。"""
+        yield self.translate(text, **kwargs)
+
+    def close(self):
+        """エンジンが所有するリソースを解放する。"""
+
+    def runtime_info(self) -> dict:
+        return {}
+
     def translate(self, text: str, beam_size: int = 1,
                   length_penalty: float = 1.0,
                   repetition_penalty: float = 1.0,
@@ -40,6 +50,18 @@ class Translator:
         raise NotImplementedError
 
 
+def create_translator(cfg: Config) -> Translator:
+    if cfg.translation_backend == "nllb":
+        return NllbCT2Translator(cfg)
+    if cfg.translation_backend == "translategemma":
+        from .gemma import TranslateGemmaTranslator
+        return TranslateGemmaTranslator(cfg)
+    if cfg.translation_backend == "hymt2":
+        from .hymt import HyMT2Translator
+        return HyMT2Translator(cfg)
+    raise ValueError(f"未知の翻訳エンジン: {cfg.translation_backend}")
+
+
 class NllbCT2Translator(Translator):
     def __init__(self, cfg: Config):
         import ctranslate2
@@ -47,7 +69,7 @@ class NllbCT2Translator(Translator):
         from transformers import AutoTokenizer
 
         print(f"[mt] NLLB モデルを準備中: {cfg.nllb_repo}")
-        model_dir = snapshot_download(cfg.nllb_repo)
+        model_dir = snapshot_download(cfg.nllb_repo, cache_dir=cfg.nllb_cache_dir or None)
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_dir, src_lang=cfg.source_lang_nllb)
         try:
@@ -63,6 +85,9 @@ class NllbCT2Translator(Translator):
             else:
                 raise
         self.target_lang = cfg.target_lang
+
+    def runtime_info(self) -> dict:
+        return {"device": self.model.device, "compute_type": self.model.compute_type}
 
     def translate(self, text: str, beam_size: int = 1,
                   length_penalty: float = 1.0,
@@ -150,12 +175,19 @@ class TranslationWorker(threading.Thread):
         self.stop_event = stop_event
         self.dictionary = dictionary
         self.transcript_writer = transcript_writer
-        self._passthrough_source = is_japanese_source_language(cfg.source_language)
+        self._active_language = cfg.source_language
         # 暫定字幕のチラつき防止: 完結した文の訳をセグメント内でキャッシュし、
         # 表示済みの訳が更新のたびに書き換わらないようにする
         self._sentence_cache: dict[str, str] = {}
         self._final_buffer: list[dict] = []
         self._final_buffer_updated_at = 0.0
+        self._visible_partial_chars = 0
+
+    def _entry_language(self, entry: dict) -> str:
+        return entry.get("language", self.cfg.source_language)
+
+    def _is_passthrough(self, entry: dict) -> bool:
+        return is_japanese_source_language(self._entry_language(entry))
 
     def run(self):
         idle_since = 0.0
@@ -179,17 +211,21 @@ class TranslationWorker(threading.Thread):
                     pending.append(self.in_queue.get_nowait())
                 except queue.Empty:
                     break
-            finals = [p for p in pending if p["kind"] == "final"]
-            partials = [p for p in pending if p["kind"] == "partial"]
-            for entry in finals:
-                self._handle_final(entry)
+            latest_partial = None
+            for entry in pending:
+                if entry["kind"] == "final":
+                    self._handle_final(entry)
+                    # この確定より前の暫定結果は、すでに確定済みの発話。
+                    latest_partial = None
+                elif entry["kind"] == "partial":
+                    latest_partial = entry
             self._flush_stale_final_buffer()
-            if partials:
-                self._translate_one(partials[-1])
+            if latest_partial is not None:
+                self._translate_one(latest_partial)
         self._flush_final_buffer("stop")
 
     def _handle_final(self, entry: dict, allow_split: bool = True):
-        if (self._passthrough_source
+        if (self._is_passthrough(entry)
                 or not self.cfg.translation_buffer_final_fragments):
             self._flush_final_buffer("immediate final")
             self._translate_one(entry)
@@ -289,6 +325,16 @@ class TranslationWorker(threading.Thread):
         return head, tail
 
     def _translate_one(self, entry: dict):
+        language = self._entry_language(entry)
+        # 英語の未完断片を、日本語の表示後に遅れて確定させない。
+        if (entry["text"] and self._final_buffer
+                and self._entry_language(self._final_buffer[0]) != language):
+            self._flush_final_buffer("language change")
+        if language != self._active_language:
+            self._sentence_cache.clear()
+            self._visible_partial_chars = 0
+            self._active_language = language
+        passthrough = self._is_passthrough(entry)
         if not entry["text"]:
             # 空テキスト(幻覚破棄によるクリア指示)はそのまま UI へ
             self._emit_result({"kind": entry["kind"], "en": "", "ja": "",
@@ -297,47 +343,26 @@ class TranslationWorker(threading.Thread):
                 self._sentence_cache.clear()
             return
         start = time.perf_counter()
+        preview = (self._preview_callback(entry, start)
+                   if self.cfg.translation_stream_preview and not passthrough
+                   else None)
         try:
-            if self._passthrough_source:
+            if passthrough:
                 japanese = entry["text"]
             elif entry["kind"] == "partial":
-                japanese = self._translate_partial(entry["text"])
+                japanese = self._translate_partial(entry["text"], preview)
             else:
                 if self.translator is None:
                     raise RuntimeError("翻訳モデルが未初期化です")
-                japanese = self._translate_final(entry["text"])
+                japanese = self._translate_final(entry["text"], preview)
+            if entry["kind"] == "final":
                 self._sentence_cache.clear()  # セグメント確定でキャッシュを捨てる
         except Exception as exc:
             print(f"[mt] 翻訳エラー: {exc}")
             if entry["kind"] == "final":
                 self._emit_empty_final(entry, "final translate error")
             return
-        if self.dictionary is not None and not self._passthrough_source:
-            japanese = self.dictionary.apply(japanese)
-        if not self._passthrough_source:
-            repaired = repair_translation_numbers(
-                japanese, entry["text"], self.cfg.source_language)
-            if repaired != japanese and self.cfg.log_latency:
-                print(f"[mt] 原文金額に合わせて補正: {japanese[:60]} -> {repaired[:60]}")
-            japanese = repaired
-        raw_japanese = japanese
-        cleaned = cleanup_translation_text(
-            japanese,
-            entry["text"],
-            self.cfg.source_language,
-            self.cfg.translation_suppressed_phrases,
-            self.cfg.translation_reject_short_cjk and entry["kind"] == "final",
-            self.cfg.translation_suspicious_source_min_chars,
-            self.cfg.translation_suspicious_target_max_chars,
-        )
-        if cleaned != japanese and self.cfg.log_latency:
-            print(f"[mt] 翻訳幻覚候補を{'除去' if not cleaned else '補正'}: {japanese[:60]}")
-        japanese = cleaned
-        if (japanese
-                and not self._passthrough_source
-                and self.cfg.translation_normalize_punctuation):
-            japanese = normalize_japanese_punctuation(
-                japanese, final=entry["kind"] == "final")
+        japanese, raw_japanese = self._prepare_translation(japanese, entry)
         if entry["kind"] == "final" and not japanese:
             if raw_japanese:
                 self._emit_empty_final(
@@ -354,20 +379,73 @@ class TranslationWorker(threading.Thread):
                 transcript_ja_label=self.cfg.transcript_rejected_translation_label,
             )
             return
-        japanese = apply_meeting_translation_fixes(
-            japanese, entry["text"], self.cfg.source_language)
         if self.cfg.log_latency:
             elapsed = (time.perf_counter() - start) * 1000
             source_preview = entry["text"][:60]
             print(f"[mt] {entry['kind']} {elapsed:.0f}ms: {source_preview} -> {japanese[:60]}")
-        source_text = "" if self._passthrough_source else entry["text"]
+        source_text = "" if passthrough else entry["text"]
         result = {"kind": entry["kind"], "en": source_text, "ja": japanese,
                   "speaker_change": entry.get("speaker_change", False)}
         self._emit_result(result)
 
+    def _prepare_translation(self, japanese: str, entry: dict, log: bool = True):
+        if self._is_passthrough(entry):
+            # ASRで清掃・辞書置換済み。日本語原文に翻訳専用の補正を掛けない。
+            return japanese, japanese
+        language = self._entry_language(entry)
+        if self.dictionary is not None:
+            japanese = self.dictionary.apply(japanese)
+        if self.cfg.translation_repair_numbers:
+            repaired = repair_translation_numbers(
+                japanese, entry["text"], language)
+            if repaired != japanese and self.cfg.log_latency and log:
+                print(f"[mt] 原文金額に合わせて補正: {japanese[:60]} -> {repaired[:60]}")
+            japanese = repaired
+        raw_japanese = japanese
+        cleaned = cleanup_translation_text(
+            japanese,
+            entry["text"],
+            language,
+            self.cfg.translation_suppressed_phrases,
+            self.cfg.translation_reject_short_cjk and entry["kind"] == "final",
+            self.cfg.translation_suspicious_source_min_chars,
+            self.cfg.translation_suspicious_target_max_chars,
+        )
+        if cleaned != japanese and self.cfg.log_latency and log:
+            print(f"[mt] 翻訳幻覚候補を{'除去' if not cleaned else '補正'}: {japanese[:60]}")
+        japanese = cleaned
+        if japanese and self.cfg.translation_normalize_punctuation:
+            japanese = normalize_japanese_punctuation(
+                japanese, final=entry["kind"] == "final")
+        if japanese and self.cfg.translation_meeting_fixes:
+            japanese = apply_meeting_translation_fixes(
+                japanese, entry["text"], language)
+        return japanese, raw_japanese
+
+    def _preview_callback(self, entry: dict, started: float):
+        partial = dict(entry, kind="partial")
+        last_update = None
+
+        def preview(text):
+            nonlocal last_update
+            now = time.perf_counter()
+            if last_update is not None and now - last_update < 0.08:
+                return
+            japanese, _ = self._prepare_translation(text, partial, log=False)
+            # 新しい認識結果の生成開始時に、表示済みの長い訳を数文字へ戻さない。
+            if len(japanese) < max(4, self._visible_partial_chars):
+                return
+            if last_update is None and self.cfg.log_latency:
+                print(f"[mt] preview {(now - started) * 1000:.0f}ms")
+            self._emit_result({"kind": "partial", "en": entry["text"], "ja": japanese,
+                               "speaker_change": entry.get("speaker_change", False)})
+            last_update = now
+
+        return preview
+
     def _emit_empty_final(self, entry: dict, reason: str,
                           transcript_ja: str = "", transcript_ja_label: str = ""):
-        source_text = "" if self._passthrough_source else entry["text"]
+        source_text = "" if self._is_passthrough(entry) else entry["text"]
         self._emit_result({
             "kind": "final",
             "en": source_text,
@@ -381,6 +459,10 @@ class TranslationWorker(threading.Thread):
             print(f"[mt] {reason}; 空の final としてクリア")
 
     def _emit_result(self, result: dict):
+        if result["kind"] == "final":
+            self._visible_partial_chars = 0
+        elif result.get("ja"):
+            self._visible_partial_chars = len(result["ja"])
         if result["kind"] == "final" and self.transcript_writer is not None:
             self.transcript_writer.write_final(
                 result.get("en", ""),
@@ -390,11 +472,11 @@ class TranslationWorker(threading.Thread):
                 result.get("transcript_ja_label", ""))
         self.ui_queue.put(result)
 
-    def _translate_final(self, text: str) -> str:
+    def _translate_final(self, text: str, preview=None) -> str:
         if self.translator is None:
             raise RuntimeError("翻訳モデルが未初期化です")
-        return self.translator.translate(
-            text,
+        return self._translate_with_preview(
+            text, preview,
             beam_size=self.cfg.translation_final_beam_size,
             length_penalty=self.cfg.translation_length_penalty,
             repetition_penalty=self.cfg.translation_repetition_penalty,
@@ -404,16 +486,25 @@ class TranslationWorker(threading.Thread):
             split_sentences=not self._should_translate_as_single_pass(text),
         )
 
-    def _translate_fast(self, text: str) -> str:
+    def _translate_fast(self, text: str, preview=None) -> str:
         if self.translator is None:
             raise RuntimeError("翻訳モデルが未初期化です")
-        return self.translator.translate(
-            text,
+        return self._translate_with_preview(
+            text, preview,
             beam_size=self.cfg.translation_partial_beam_size,
             max_decoding_length=self.cfg.translation_max_decoding_length,
             max_unit_chars=self.cfg.translation_unit_max_chars,
             split_sentences=True,
         )
+
+    def _translate_with_preview(self, text: str, preview, **kwargs) -> str:
+        if preview is None:
+            return self.translator.translate(text, **kwargs)
+        result = ""
+        # 同じワーカーで順序を保つ。確定後に古いストリームが再表示されない。
+        for result in self.translator.translate_stream(text, **kwargs):
+            preview(result)
+        return result
 
     def _should_translate_as_single_pass(self, text: str) -> bool:
         if not self.cfg.translation_final_single_pass:
@@ -421,9 +512,11 @@ class TranslationWorker(threading.Thread):
         compact_len = len(re.sub(r"\s+", "", text))
         return compact_len <= self.cfg.translation_single_pass_max_chars
 
-    def _translate_partial(self, text: str) -> str:
+    def _translate_partial(self, text: str, preview=None) -> str:
         """完結した文はキャッシュした訳を使い回し、末尾の言いかけの文だけを
         訳し直す。グレー字幕の頭部分が更新のたびに変わるのを防ぐ。"""
+        if self.cfg.translation_partial_full_context:
+            return self._translate_fast(text, preview)
         sentences = [s.strip() for s in _SENTENCE_SPLIT.split(text) if s.strip()]
         if not sentences:
             return ""

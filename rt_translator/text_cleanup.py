@@ -36,7 +36,6 @@ _TARGET_USD_RE = re.compile(
 )
 _JA_TERMINAL_PUNCT_RE = re.compile(r"[。！？!?…）」』】》〉]$")
 _ASCII_PUNCT_TRANSLATION = str.maketrans({
-    ",": "、",
     "?": "？",
     "!": "！",
 })
@@ -227,6 +226,8 @@ def _whole_number(value: Decimal) -> int:
 
 
 def _format_usd_for_japanese(value: Decimal) -> str:
+    if value != value.to_integral_value():
+        return f"{value:,f}ドル"
     amount = _whole_number(value)
     if amount >= 100_000_000:
         oku, rest = divmod(amount, 100_000_000)
@@ -252,13 +253,11 @@ def repair_translation_numbers(text: str, source_text: str,
     if not amounts:
         return text
 
-    repaired = text
-    for amount in amounts:
-        replacement = _format_usd_for_japanese(amount)
-        repaired, count = _TARGET_USD_RE.subn(replacement, repaired, count=1)
-        if count == 0:
-            break
-    return repaired
+    # 対応数が違うと位置だけでは金額を特定できないため、推測して上書きしない。
+    if len(_TARGET_USD_RE.findall(text)) != len(amounts):
+        return text
+    replacements = iter(_format_usd_for_japanese(amount) for amount in amounts)
+    return _TARGET_USD_RE.sub(lambda match: next(replacements), text)
 
 
 def _contains_any(text: str, words: tuple[str, ...]) -> bool:
@@ -288,6 +287,8 @@ def normalize_japanese_punctuation(text: str, final: bool = False) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return ""
+    # 1,000 の桁区切りは保持する。
+    text = re.sub(r"(?<!\d),|,(?!\d)", "、", text)
     text = text.translate(_ASCII_PUNCT_TRANSLATION)
     # 数値の小数点は壊さず、文末/空白前のピリオドだけ句点に寄せる。
     text = re.sub(r"(?<!\d)\.(?!\d)", "。", text)
