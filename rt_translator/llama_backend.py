@@ -15,6 +15,7 @@ import urllib.request
 from .config import Config
 from .gemma_setup import ROOT, RUNTIME_VERSION, ensure_model, ensure_runtime, get_model_spec
 from .translator import Translator
+from .win_process import bind_child_lifetime, kill_orphaned_processes
 
 
 class LocalLlamaTranslator(Translator):
@@ -71,12 +72,19 @@ class LocalLlamaTranslator(Translator):
         for key in list(environment):
             if key.startswith("LLAMA_ARG_"):
                 environment.pop(key)
+        # 前回の異常終了で残ったサーバーが VRAM を占有していると、今回のロードが
+        # 共有メモリへあふれて極端に遅くなる(起動時に固まったように見える)。
+        # 利用者が指定した llama.cpp には他用途のサーバーがありうるので、同梱版に限る。
+        if not server_path:
+            kill_orphaned_processes(server.parent, server.name)
         try:
             self._log = self.log_path.open("wb")
             self._process = subprocess.Popen(
                 command, stdin=subprocess.DEVNULL, stdout=self._log, stderr=subprocess.STDOUT,
                 cwd=server.parent, env=environment,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            # コンソールの×や強制終了では atexit が走らないため、OS 側でも道連れにする。
+            bind_child_lifetime(self._process)
             atexit.register(self.close)
             print(f"[mt] {self._model_label}をGPUへロード中...")
             self._wait_ready()
@@ -103,8 +111,13 @@ class LocalLlamaTranslator(Translator):
             return json.load(response)
 
     def _wait_ready(self):
-        deadline = time.monotonic() + self._startup_timeout
+        started = time.monotonic()
+        deadline = started + self._startup_timeout
+        next_report = started + 15
         while time.monotonic() < deadline:
+            if time.monotonic() >= next_report:
+                print(f"[mt] ロード中... {time.monotonic() - started:.0f}秒経過", flush=True)
+                next_report += 15
             if self._process.poll() is not None:
                 raise RuntimeError(f"llama-serverが起動に失敗しました。ログ: {self.log_path}")
             try:

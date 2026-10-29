@@ -40,8 +40,10 @@ class Config:
     translation_backend: str = "nllb"   # nllb / translategemma / hymt2
     translation_partial_full_context: bool = False
     translation_stream_preview: bool = False  # 生成中の訳をグレー字幕へ順次表示
-    translation_meeting_fixes: bool = True
-    translation_repair_numbers: bool = True
+    # 特定会議向けの用語置換・金額補正。別の会議では誤訳を作るので既定は無効。
+    translation_meeting_fixes: bool = False
+    translation_fixes_file: str = "translation_fixes.txt"  # 用語置換のルール(git 管理外)
+    translation_repair_numbers: bool = False
     gemma_model: str = "12b-q8_0"      # 12b-q8_0 / 27b-q6_k（固定リビジョン）
     gemma_model_path: str = ""         # 空ならgemma_modelのモデルを自動取得
     gemma_server_path: str = ""        # 空なら公式llama.cppを自動取得

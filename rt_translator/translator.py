@@ -10,8 +10,9 @@ import threading
 import time
 
 from .config import Config
-from .text_cleanup import (apply_meeting_translation_fixes,
+from .text_cleanup import (apply_translation_fixes,
                            cleanup_translation_text,
+                           load_translation_fixes,
                            normalize_japanese_punctuation,
                            repair_translation_numbers)
 
@@ -66,10 +67,16 @@ class NllbCT2Translator(Translator):
     def __init__(self, cfg: Config):
         import ctranslate2
         from huggingface_hub import snapshot_download
+        from huggingface_hub.errors import LocalEntryNotFoundError
         from transformers import AutoTokenizer
 
         print(f"[mt] NLLB モデルを準備中: {cfg.nllb_repo}")
-        model_dir = snapshot_download(cfg.nllb_repo, cache_dir=cfg.nllb_cache_dir or None)
+        cache_dir = cfg.nllb_cache_dir or None
+        try:  # キャッシュ済みなら起動時に HuggingFace へ問い合わせない
+            model_dir = snapshot_download(cfg.nllb_repo, cache_dir=cache_dir,
+                                          local_files_only=True)
+        except LocalEntryNotFoundError:
+            model_dir = snapshot_download(cfg.nllb_repo, cache_dir=cache_dir)
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_dir, src_lang=cfg.source_lang_nllb)
         try:
@@ -182,6 +189,8 @@ class TranslationWorker(threading.Thread):
         self._final_buffer: list[dict] = []
         self._final_buffer_updated_at = 0.0
         self._visible_partial_chars = 0
+        self._translation_fixes = (load_translation_fixes(cfg.translation_fixes_file)
+                                   if cfg.translation_meeting_fixes else [])
 
     def _entry_language(self, entry: dict) -> str:
         return entry.get("language", self.cfg.source_language)
@@ -417,9 +426,9 @@ class TranslationWorker(threading.Thread):
         if japanese and self.cfg.translation_normalize_punctuation:
             japanese = normalize_japanese_punctuation(
                 japanese, final=entry["kind"] == "final")
-        if japanese and self.cfg.translation_meeting_fixes:
-            japanese = apply_meeting_translation_fixes(
-                japanese, entry["text"], language)
+        if japanese and self._translation_fixes:
+            japanese = apply_translation_fixes(
+                japanese, entry["text"], language, self._translation_fixes)
         return japanese, raw_japanese
 
     def _preview_callback(self, entry: dict, started: float):

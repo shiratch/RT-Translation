@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 config.json
 user_dictionary.txt
+translation_fixes.txt
 transcripts/
 .model-cache/
 benchmark-results/

@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
@@ -12,7 +13,9 @@ import numpy as np
 
 from rt_translator.asr import StreamingTranscriber
 from rt_translator.config import Config, load_config
-from rt_translator.text_cleanup import (normalize_japanese_punctuation,
+from rt_translator.text_cleanup import (apply_translation_fixes,
+                                       load_translation_fixes,
+                                       normalize_japanese_punctuation,
                                        repair_translation_numbers)
 from rt_translator.translator import TranslationWorker
 
@@ -33,6 +36,29 @@ class TextIntegrityTests(unittest.TestCase):
         self.assertEqual(repair_translation_numbers("合計は30ドルです。",
                                                    "$10 plus $20", "en"),
                          "合計は30ドルです。")
+
+    def test_meeting_fixes_are_disabled_by_default(self):
+        cfg = Config()
+        self.assertFalse(cfg.translation_meeting_fixes)
+        self.assertFalse(cfg.translation_repair_numbers)
+
+    def test_translation_fixes_do_not_rewrite_tone(self):
+        for ja in ("大丈夫だった。", "そうだったんです。", "問題ないですよね。", "分かってるの？"):
+            self.assertEqual(apply_translation_fixes(ja, "It was fine.", "en", []), ja)
+
+    def test_translation_fixes_file_rules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fixes.txt"
+            path.write_text("# comment\n林檎=りんご\napple,pie | 円周率=パイ\n"
+                            "any questions | *=質問はありますか？\n", encoding="utf-8")
+            fixes = load_translation_fixes(str(path))
+        self.assertEqual(apply_translation_fixes("林檎の円周率", "Apple Pie", "en", fixes),
+                         "りんごのパイ")
+        # 原文に条件語がそろわなければ条件付きルールは使わない
+        self.assertEqual(apply_translation_fixes("円周率", "pie chart", "en", fixes), "円周率")
+        self.assertEqual(apply_translation_fixes("何か質問は", "Any questions?", "en", fixes),
+                         "質問はありますか？")
+        self.assertEqual(load_translation_fixes(str(Path(tmp) / "missing.txt")), [])
 
     def test_punctuation_preserves_thousands_and_decimals(self):
         self.assertEqual(normalize_japanese_punctuation("価格は1,234.50ドル, 確認?", True),

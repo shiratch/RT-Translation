@@ -6,12 +6,15 @@
   silence_finalize 秒続いたらそのセグメントを確定認識してバッファをリセット
 - 出力は {"kind": "partial"|"final", "text": str} を out_queue へ
 """
+import os
 import queue
 import threading
 import time
 
 import numpy as np
 from faster_whisper import WhisperModel
+from faster_whisper.utils import download_model
+from huggingface_hub.errors import LocalEntryNotFoundError
 from faster_whisper.vad import VadOptions, get_speech_timestamps
 
 from .audio_capture import TARGET_RATE
@@ -51,10 +54,23 @@ class StreamingTranscriber(threading.Thread):
         # 妨げるので短くする(セグメント切り出し時に自前で前パディングする)
         self._vad_options = VadOptions(min_silence_duration_ms=250, speech_pad_ms=100)
 
+    @staticmethod
+    def _resolve_model_path(model: str) -> str:
+        # 既定では起動のたびに HuggingFace へ更新確認するため、回線が遅いと
+        # ロード前に待たされる。キャッシュ済みならネットワークに出ない。
+        if os.path.isdir(model):
+            return model
+        try:
+            return download_model(model, local_files_only=True)
+        except LocalEntryNotFoundError:
+            print(f"[asr] Whisper '{model}' を取得します...")
+            return download_model(model)
+
     def _load_model(self) -> WhisperModel:
         cfg = self.cfg
+        model_path = self._resolve_model_path(cfg.whisper_model)
         try:
-            model = BilingualWhisperModel(cfg.whisper_model, device=cfg.device,
+            model = BilingualWhisperModel(model_path, device=cfg.device,
                                  device_index=cfg.device_index,
                                  compute_type=cfg.whisper_compute_type,
                                  num_workers=cfg.whisper_num_workers,
@@ -65,7 +81,7 @@ class StreamingTranscriber(threading.Thread):
         except Exception as exc:
             if cfg.device == "cuda":
                 print(f"[asr] CUDA でのロードに失敗、CPU にフォールバックします: {exc}")
-                return BilingualWhisperModel(cfg.whisper_model, device="cpu", compute_type="int8")
+                return BilingualWhisperModel(model_path, device="cpu", compute_type="int8")
             raise
 
     def run(self):
