@@ -1,7 +1,7 @@
 """透過オーバーレイ字幕ウィンドウ (tkinter)。
 
 - 枠なし・常に最前面・半透明の黒帯に日本語字幕を表示
-- 確定訳は白、翻訳中の暫定訳はグレー
+- 最新の確定結果は全文ライムグリーン、過去の確定結果は白、暫定結果はグレー
 - 左ドラッグで移動、右クリックメニューでフォントサイズ変更・終了
 - マウスホイールで過去の字幕に遡れる。右端のシークバーでも操作可能
   (遡り中は新しい字幕が来ても表示位置を固定し、最下部に戻ると追従再開)
@@ -29,6 +29,7 @@ class SubtitleOverlay:
 
         # 確定訳の履歴。1 要素 = 1 話者ターン(同一話者の連続発話は連結される)
         self.history: deque[str] = deque(maxlen=MAX_HISTORY)
+        self._latest_final_chars = 0  # 最新の確定結果全体（改行を除く文字数）
         self.view_offset = 0        # 0=最新に追従 / n=末尾から n 件遡った位置
         self._live_partial = ""     # 遡り中も裏で保持し、最新に戻ったら表示
         self._live_partial_change = False  # 暫定字幕が新しい話者かどうか
@@ -62,17 +63,17 @@ class SubtitleOverlay:
             wraplength=self._wraplength)
         if cfg.show_source:
             self.label_source.pack(fill="x", padx=20, pady=(8, 0))
-        self.label_final = tk.Label(
-            content, text="", fg="white", bg=BG, justify="left", anchor="w",
-            wraplength=self._wraplength)
-        self.label_final.pack(fill="x", padx=20, pady=(8, 0))
+        # 同じ話者ターンの途中から色を変えられるよう、行内の文字を描き分ける。
+        self.final_canvas = tk.Canvas(
+            content, width=1, height=1, bg=BG, highlightthickness=0, borderwidth=0)
+        self.final_canvas.pack(fill="x", padx=20, pady=(8, 0))
         self.label_partial = tk.Label(
             content, text="", fg="#a0a0a0", bg=BG, justify="left", anchor="w",
             wraplength=self._wraplength)
         self.label_partial.pack(fill="x", padx=20, pady=(0, 8))
         self._apply_font()
 
-        for widget in (self.root, content, self.label_source, self.label_final,
+        for widget in (self.root, content, self.label_source, self.final_canvas,
                        self.label_partial):
             widget.bind("<Button-1>", self._drag_start)
             widget.bind("<B1-Motion>", self._drag_move)
@@ -98,7 +99,6 @@ class SubtitleOverlay:
     def _apply_font(self):
         self._font_main = tkfont.Font(family=self.cfg.font_family, size=self.font_size)
         small = (self.cfg.font_family, max(10, int(self.font_size * 0.6)))
-        self.label_final.configure(font=self._font_main)
         self.label_partial.configure(font=self._font_main)
         self.label_source.configure(font=small)
 
@@ -109,6 +109,7 @@ class SubtitleOverlay:
 
     def _clear(self):
         self.history.clear()
+        self._latest_final_chars = 0
         self.view_offset = 0
         self._live_partial = ""
         self._live_partial_change = False
@@ -147,6 +148,34 @@ class SubtitleOverlay:
             lines.extend(self._wrap_text_lines(marker + turn))
         return lines
 
+    def _draw_final_lines(self, lines: list[str], start: int, end: int):
+        # 最新の確定結果全体を、文数・折り返しにかかわらず同じ色で描く。
+        # 履歴を遡っても、画面末尾の古い文を新しい確定結果として強調しない。
+        highlight_starts = {}
+        remaining = self._latest_final_chars
+        for row in range(len(lines) - 1, -1, -1):
+            if remaining <= 0:
+                break
+            count = min(remaining, len(lines[row]))
+            if count:
+                highlight_starts[row] = len(lines[row]) - count
+            remaining -= count
+
+        self.final_canvas.delete("all")
+        line_height = self._font_main.metrics("linespace")
+        self.final_canvas.configure(height=max(1, end - start) * line_height + 2)
+        for row in range(start, end):
+            line = lines[row]
+            split = highlight_starts.get(row, len(line))
+            for offset, text, color in (
+                    (0, line[:split], "white"),
+                    (split, line[split:], self.cfg.latest_final_color)):
+                if text:
+                    self.final_canvas.create_text(
+                        1 + self._font_main.measure(line[:offset]),
+                        1 + (row - start) * line_height,
+                        text=text, fill=color, font=self._font_main, anchor="nw")
+
     def _tail_fit(self, text: str, max_lines: int) -> str:
         """max_lines 行に収まるように文頭側を「…」で切り詰める。"""
         if self._count_lines(text) <= max_lines:
@@ -178,7 +207,7 @@ class SubtitleOverlay:
         final_lines = self._final_history_lines()
         end = max(0, len(final_lines) - self.view_offset)
         start = max(0, end - budget)
-        self.label_final.configure(text="\n".join(final_lines[start:end]))
+        self._draw_final_lines(final_lines, start, end)
         self.label_partial.configure(text=partial)
         if self.cfg.show_source:
             self.label_source.configure(text=self._live_source if live else "")
@@ -266,6 +295,8 @@ class SubtitleOverlay:
             self.history[-1] = self.history[-1] + item["ja"]
         else:
             self.history.append(item["ja"])
+        # 同じ話者の以前の確定結果と連結しても、今回届いた全文だけを強調する。
+        self._latest_final_chars = len(item["ja"].replace("\n", ""))
         # 遡り中は表示位置を固定する(deque が満杯のときは全体が
         # 1 つずれるので補正不要)
         if self.view_offset > 0:

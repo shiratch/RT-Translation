@@ -1,5 +1,6 @@
 """ASR/翻訳出力の繰り返し幻覚を抑制する。"""
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from pathlib import Path
 import re
 
 TOKEN_REPETITION_MIN = 8
@@ -36,7 +37,6 @@ _TARGET_USD_RE = re.compile(
 )
 _JA_TERMINAL_PUNCT_RE = re.compile(r"[。！？!?…）」』】》〉]$")
 _ASCII_PUNCT_TRANSLATION = str.maketrans({
-    ",": "、",
     "?": "？",
     "!": "！",
 })
@@ -50,19 +50,6 @@ _SUPPRESSED_SUBSTRING_SEEDS = {
     "次回の動画でお会いしましょう",
 }
 
-_MEETING_TERM_REPLACEMENTS = ()
-
-_MEETING_TONE_REPLACEMENTS = (
-    ("教えて下さい", "教えてください"),
-    ("分かってる", "分かりました"),
-    ("わかった", "分かりました"),
-    ("ワオ", "なるほど"),
-    ("そうだ", "そうです"),
-    ("大丈夫だ", "大丈夫です"),
-    ("問題ない", "問題ありません"),
-    ("聞こえるか", "聞こえますか"),
-    ("ミムミム", "はい"),
-)
 
 
 def _is_mostly_repetition(text_len: int, removed: int, min_len: int) -> bool:
@@ -227,6 +214,8 @@ def _whole_number(value: Decimal) -> int:
 
 
 def _format_usd_for_japanese(value: Decimal) -> str:
+    if value != value.to_integral_value():
+        return f"{value:,f}ドル"
     amount = _whole_number(value)
     if amount >= 100_000_000:
         oku, rest = divmod(amount, 100_000_000)
@@ -252,35 +241,55 @@ def repair_translation_numbers(text: str, source_text: str,
     if not amounts:
         return text
 
-    repaired = text
-    for amount in amounts:
-        replacement = _format_usd_for_japanese(amount)
-        repaired, count = _TARGET_USD_RE.subn(replacement, repaired, count=1)
-        if count == 0:
-            break
-    return repaired
+    # 対応数が違うと位置だけでは金額を特定できないため、推測して上書きしない。
+    if len(_TARGET_USD_RE.findall(text)) != len(amounts):
+        return text
+    replacements = iter(_format_usd_for_japanese(amount) for amount in amounts)
+    return _TARGET_USD_RE.sub(lambda match: next(replacements), text)
 
 
-def _contains_any(text: str, words: tuple[str, ...]) -> bool:
-    return any(word in text for word in words)
+def load_translation_fixes(path: str) -> list[tuple[tuple[str, ...], str, str]]:
+    """訳文の補正ルールを読む。会議固有の用語は公開リポジトリに置かず、このファイルに書く。
+
+    書式(1行1ルール、# と空行は無視):
+      誤訳=正訳                     … 常に置換
+      原文の語,原文の語 | 誤訳=正訳  … 英語原文に全ての語を含むときだけ置換
+      原文の語 | *=正訳             … 条件に合えば訳文全体を置き換える
+    """
+    fixes = []
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return fixes
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        condition, _, rule = line.rpartition(" | ")
+        wrong, _, correct = rule.partition("=")
+        words = tuple(w.strip().lower() for w in condition.split(",") if w.strip())
+        if wrong.strip():
+            fixes.append((words, wrong.strip(), correct.strip()))
+    return fixes
 
 
-def _apply_meeting_tone_replacements(text: str) -> str:
-    for wrong, correct in _MEETING_TONE_REPLACEMENTS:
-        text = text.replace(wrong, correct)
-    return text.replace("お前", "あなた")
+def apply_translation_fixes(text: str, source_text: str, source_language: str,
+                            fixes: list[tuple[tuple[str, ...], str, str]]) -> str:
+    """load_translation_fixes() のルールを上から順に適用する(既定は無効)。
 
-
-def apply_meeting_translation_fixes(text: str, source_text: str,
-                                    source_language: str) -> str:
-    """会議字幕向けに、NLLBが崩しやすい技術語と強い口調を補正する。"""
+    口調の言い換え(だ→です 等)は部分一致で「大丈夫ですった」のように文を
+    壊すため行わない。文体の統一は議事録化する後段の LLM に任せる。
+    """
     if not text or not _is_english_source_language(source_language):
         return text
-
-    for wrong, correct in _MEETING_TERM_REPLACEMENTS:
+    source = source_text.lower()
+    for words, wrong, correct in fixes:
+        if not all(word in source for word in words):
+            continue
+        if wrong == "*":
+            return correct
         text = text.replace(wrong, correct)
-
-    return _apply_meeting_tone_replacements(text)
+    return text
 
 
 def normalize_japanese_punctuation(text: str, final: bool = False) -> str:
@@ -288,6 +297,8 @@ def normalize_japanese_punctuation(text: str, final: bool = False) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return ""
+    # 1,000 の桁区切りは保持する。
+    text = re.sub(r"(?<!\d),|,(?!\d)", "、", text)
     text = text.translate(_ASCII_PUNCT_TRANSLATION)
     # 数値の小数点は壊さず、文末/空白前のピリオドだけ句点に寄せる。
     text = re.sub(r"(?<!\d)\.(?!\d)", "。", text)

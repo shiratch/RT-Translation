@@ -6,15 +6,19 @@
   silence_finalize 秒続いたらそのセグメントを確定認識してバッファをリセット
 - 出力は {"kind": "partial"|"final", "text": str} を out_queue へ
 """
+import os
 import queue
 import threading
 import time
 
 import numpy as np
 from faster_whisper import WhisperModel
+from faster_whisper.utils import download_model
+from huggingface_hub.errors import LocalEntryNotFoundError
 from faster_whisper.vad import VadOptions, get_speech_timestamps
 
 from .audio_capture import TARGET_RATE
+from .bilingual_whisper import BilingualWhisperModel
 from .config import Config
 from .text_cleanup import cleanup_asr_text
 
@@ -36,8 +40,11 @@ class StreamingTranscriber(threading.Thread):
         self.speaker_detector = speaker_detector
         self.dictionary = dictionary
         self.model = model if model is not None else self._load_model()
-        self.model_lock = model_lock if model_lock is not None else threading.Lock()
+        self.model_lock = (model_lock if model_lock is not None
+                           else threading.BoundedSemaphore(cfg.whisper_num_workers))
         self.source_language = source_language or cfg.source_language
+        self.detected_language = self.source_language
+        self.bilingual = cfg.asr_bilingual and self.source_language == "en"
         self.emit_partials = emit_partials
         self.use_hotwords = use_hotwords
         self.min_segment_rms = min_segment_rms
@@ -47,19 +54,34 @@ class StreamingTranscriber(threading.Thread):
         # 妨げるので短くする(セグメント切り出し時に自前で前パディングする)
         self._vad_options = VadOptions(min_silence_duration_ms=250, speech_pad_ms=100)
 
+    @staticmethod
+    def _resolve_model_path(model: str) -> str:
+        # 既定では起動のたびに HuggingFace へ更新確認するため、回線が遅いと
+        # ロード前に待たされる。キャッシュ済みならネットワークに出ない。
+        if os.path.isdir(model):
+            return model
+        try:
+            return download_model(model, local_files_only=True)
+        except LocalEntryNotFoundError:
+            print(f"[asr] Whisper '{model}' を取得します...")
+            return download_model(model)
+
     def _load_model(self) -> WhisperModel:
         cfg = self.cfg
+        model_path = self._resolve_model_path(cfg.whisper_model)
         try:
-            model = WhisperModel(cfg.whisper_model, device=cfg.device,
+            model = BilingualWhisperModel(model_path, device=cfg.device,
                                  device_index=cfg.device_index,
-                                 compute_type=cfg.whisper_compute_type)
+                                 compute_type=cfg.whisper_compute_type,
+                                 num_workers=cfg.whisper_num_workers,
+                                 flash_attention=cfg.whisper_flash_attention)
             print(f"[asr] Whisper '{cfg.whisper_model}' を "
                   f"{cfg.device}:{cfg.device_index} でロードしました")
             return model
         except Exception as exc:
             if cfg.device == "cuda":
                 print(f"[asr] CUDA でのロードに失敗、CPU にフォールバックします: {exc}")
-                return WhisperModel(cfg.whisper_model, device="cpu", compute_type="int8")
+                return BilingualWhisperModel(model_path, device="cpu", compute_type="int8")
             raise
 
     def run(self):
@@ -145,6 +167,7 @@ class StreamingTranscriber(threading.Thread):
                     speaker_change = self.speaker_detector.is_change(segment)
                 # text が空(幻覚破棄)でも流し、画面のグレー字幕をクリアさせる
                 self.out_queue.put({"kind": "final", "text": text,
+                                    "language": self.detected_language,
                                     "speaker_change": speaker_change})
             elif self.emit_partials and time.monotonic() - last_partial_at >= cfg.partial_interval:
                 speech_end = speech[-1]["end"]
@@ -162,6 +185,7 @@ class StreamingTranscriber(threading.Thread):
                     speaker_change = self.speaker_detector.peek_change(segment)
                 text = self._transcribe(segment, beam_size=cfg.partial_beam_size, kind="partial")
                 self.out_queue.put({"kind": "partial", "text": text,
+                                    "language": self.detected_language,
                                     "speaker_change": speaker_change})
         self._flush_remaining_buffer(buffer)
 
@@ -173,22 +197,30 @@ class StreamingTranscriber(threading.Thread):
             segments, _ = self.model.transcribe(
                 audio,
                 language=self.source_language,
+                multilingual=self.bilingual,
                 beam_size=beam_size,
-                # 圧縮率チェックに失敗したセグメントは温度を上げて再試行させる
-                temperature=[0.0, 0.2, 0.4],
+                # 暫定は次の音声が来れば再認識できる。確定時は従来の再試行を残す。
+                temperature=([0.0, 0.2, 0.4]
+                             if kind == "final" or self.cfg.partial_temperature_fallback
+                             else [0.0]),
                 condition_on_previous_text=False,
                 without_timestamps=True,
                 hotwords=hotwords,
             )
-        text = "".join(seg.text for seg in segments).strip()
-        cleaned = self._cleanup_text(text)
+            # transcribe() は generator を返す。実際の推論が終わるまで枠を保持する。
+            segments = list(segments)
+            text = "".join(seg.text for seg in segments).strip()
+            self.detected_language = (getattr(segments[0], "language", self.source_language)
+                                      if segments else self.source_language)
+        language = self.detected_language
+        cleaned = self._cleanup_text(text, language)
         if cleaned != text and self.cfg.log_latency:
             print(f"[asr] 幻覚候補を{'除去' if not cleaned else '補正'}: {text[:60]}")
         text = cleaned
         if self.dictionary is not None:
             before_dict = text
-            text = self.dictionary.apply(text, self.source_language)
-            cleaned = self._cleanup_text(text)
+            text = self.dictionary.apply(text, language)
+            cleaned = self._cleanup_text(text, language)
             if cleaned != text and self.cfg.log_latency:
                 print(f"[asr] 辞書適用後の幻覚候補を{'除去' if not cleaned else '補正'}: {text[:60]}")
             text = cleaned
@@ -199,7 +231,7 @@ class StreamingTranscriber(threading.Thread):
         if self.cfg.log_latency:
             elapsed = (time.perf_counter() - start) * 1000
             audio_sec = len(audio) / TARGET_RATE
-            print(f"[asr] {kind} {audio_sec:.1f}s -> {elapsed:.0f}ms: {text[:60]}")
+            print(f"[asr] {kind} {language} {audio_sec:.1f}s -> {elapsed:.0f}ms: {text[:60]}")
         return text
 
     def _flush_remaining_buffer(self, buffer: np.ndarray):
@@ -220,6 +252,7 @@ class StreamingTranscriber(threading.Thread):
         if text and self.speaker_detector is not None:
             speaker_change = self.speaker_detector.is_change(segment)
         self.out_queue.put({"kind": "final", "text": text,
+                            "language": self.detected_language,
                             "speaker_change": speaker_change})
 
     def _speech_duration(self, speech: list[dict], start: int, end: int) -> float:
@@ -261,10 +294,10 @@ class StreamingTranscriber(threading.Thread):
                 return False
         return True
 
-    def _cleanup_text(self, text: str) -> str:
+    def _cleanup_text(self, text: str, language: str | None = None) -> str:
         return cleanup_asr_text(
             text,
-            self.source_language,
+            language or self.source_language,
             self.suppressed_phrases or self.cfg.asr_suppressed_phrases,
             self.cfg.english_asr_reject_cjk,
             (self.suppressed_substring_max_chars

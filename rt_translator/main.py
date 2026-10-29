@@ -3,6 +3,7 @@ import os
 import queue
 import sys
 import threading
+import traceback
 from pathlib import Path
 
 
@@ -36,15 +37,35 @@ def _source_language_label(language: str, is_japanese_source_language) -> str:
 def main():
     _add_nvidia_dll_dirs()
 
-    from .asr import StreamingTranscriber
-    from .audio_capture import LoopbackCapture, MicrophoneCapture
     from .config import load_config
-    from .overlay import SubtitleOverlay
-    from .transcript import TranscriptOnlyWorker, TranscriptWriter
-    from .translator import (NllbCT2Translator, TranslationWorker,
-                             is_japanese_source_language)
+    from .dictionary import UserDictionary
+    from .transcript import TranscriptWriter
+    from .translator import create_translator, is_japanese_source_language
 
     cfg = load_config()
+    print("=== RT Translator: モデルをロードしています(初回はダウンロードに数分かかります) ===")
+    dictionary = UserDictionary(cfg.user_dictionary)
+    transcript_writer = TranscriptWriter(cfg)
+    if is_japanese_source_language(cfg.source_language):
+        print("[mt] 日本語音声の文字起こしモード: 翻訳モデルはロードしません")
+        translator = None
+    else:
+        translator = create_translator(cfg)
+    # 以降(Whisper のロード等)で失敗しても、翻訳サーバーは必ず止める。
+    try:
+        _run_session(cfg, translator, dictionary, transcript_writer)
+    finally:
+        if translator is not None:
+            translator.close()
+
+
+def _run_session(cfg, translator, dictionary, transcript_writer):
+    from .asr import StreamingTranscriber
+    from .audio_capture import LoopbackCapture, MicrophoneCapture
+    from .overlay import SubtitleOverlay
+    from .transcript import TranscriptOnlyWorker
+    from .translator import TranslationWorker, is_japanese_source_language
+
     stop_event = threading.Event()
     audio_queue = queue.Queue()
     text_queue = queue.Queue()
@@ -53,15 +74,6 @@ def main():
     mic_asr = None
     mic_writer = None
 
-    print("=== RT Translator: モデルをロードしています(初回はダウンロードに数分かかります) ===")
-    from .dictionary import UserDictionary
-    dictionary = UserDictionary(cfg.user_dictionary)
-    transcript_writer = TranscriptWriter(cfg)
-    if is_japanese_source_language(cfg.source_language):
-        print("[mt] 日本語音声の文字起こしモード: 翻訳モデルはロードしません")
-        translator = None
-    else:
-        translator = NllbCT2Translator(cfg)
     speaker_detector = None
     if cfg.speaker_change_detection:
         from .speaker import SpeakerChangeDetector
@@ -89,6 +101,7 @@ def main():
                 speaker_detector=None, dictionary=dictionary,
                 model=asr.model, model_lock=asr.model_lock,
                 source_language=mic_source_language, name="asr-mic",
+                emit_partials=False,
                 use_hotwords=cfg.mic_dictionary_hotwords,
                 min_segment_rms=cfg.mic_min_segment_rms,
                 suppressed_phrases=cfg.mic_asr_suppressed_phrases,
@@ -106,15 +119,21 @@ def main():
                 mic_capture = None
 
     language_label = _source_language_label(cfg.source_language, is_japanese_source_language)
+    if cfg.asr_bilingual and cfg.source_language == "en":
+        language_label = "英語・日本語音声（英語は翻訳、日本語は文字起こし）"
     print(f"=== 準備完了。{language_label}を再生すると字幕が表示されます(字幕右クリックで終了) ===")
     overlay = SubtitleOverlay(cfg, ui_queue, stop_event)
     try:
         overlay.run()
     finally:
         stop_event.set()
-        capture.stop()
-        if mic_capture is not None:
-            mic_capture.stop()
+        print("=== 終了処理中: 残りの発話を保存しています ===", flush=True)
+        for audio in (capture, mic_capture):
+            if audio is not None:
+                try:
+                    audio.stop()
+                except Exception as exc:
+                    print(f"[audio] キャプチャ停止に失敗しました: {exc}")
         asr.join(timeout=cfg.shutdown_drain_seconds + 1.0)
         if mic_asr is not None:
             mic_asr.join(timeout=cfg.shutdown_drain_seconds + 1.0)
@@ -123,5 +142,31 @@ def main():
             mic_writer.join(timeout=cfg.shutdown_drain_seconds + 1.0)
 
 
+def _run():
+    from .win_process import disable_console_quick_edit
+    restore_console = disable_console_quick_edit()
+    exit_code = 1
+    try:
+        main()
+        exit_code = 0
+    except SystemExit as exc:
+        if exc.code is None or isinstance(exc.code, int):
+            exit_code = exc.code or 0
+        else:
+            print(exc.code, file=sys.stderr)
+    except KeyboardInterrupt:
+        exit_code = 130
+    except BaseException:
+        traceback.print_exc()
+    finally:
+        # 後片付けは main() 内で済んでいる。ここで通常終了に任せると、
+        # 推論中のデーモンスレッドや CUDA モデルの破棄でインタプリタの終了処理が
+        # 止まり、プロセスごと VRAM を掴み続けることがある。OS に即時回収させる。
+        restore_console()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(exit_code)
+
+
 if __name__ == "__main__":
-    main()
+    _run()

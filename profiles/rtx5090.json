@@ -1,0 +1,18 @@
+{
+  "device": "cuda",
+  "whisper_model": "large-v3-turbo",
+  "whisper_compute_type": "float16",
+  "whisper_num_workers": 2,
+  "asr_bilingual": true,
+  "whisper_flash_attention": false,
+  "partial_interval": 0.6,
+  "partial_beam_size": 1,
+  "final_beam_size": 5,
+  "nllb_repo": "KomorebiAI/nllb-200-3.3B-int8-ct2",
+  "nllb_cache_dir": ".model-cache",
+  "nllb_compute_type": "float16",
+  "translation_partial_beam_size": 1,
+  "translation_final_beam_size": 4,
+  "translation_incomplete_fragment_flush_seconds": 1.0,
+  "translation_deferred_fragment_flush_seconds": 1.5
+}

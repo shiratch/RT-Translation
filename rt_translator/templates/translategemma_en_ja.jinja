@@ -1,0 +1,14 @@
+{# Text-only en -> ja adaptation of the template embedded in google/translategemma-12b-it.
+   Gemma terms: https://ai.google.dev/gemma/terms
+   Keep the rendered instruction identical; accept llama.cpp's string content. #}
+{{- bos_token -}}
+{%- for message in messages -%}
+    {%- if message['role'] == 'user' -%}
+        {{- '<start_of_turn>user\nYou are a professional English (en) to Japanese (ja) translator. Your goal is to accurately convey the meaning and nuances of the original English text while adhering to Japanese grammar, vocabulary, and cultural sensitivities.\nProduce only the Japanese translation, without any additional explanations or commentary. Please translate the following English text into Japanese:\n\n\n' + (message['content'] | trim) + '<end_of_turn>\n' -}}
+    {%- elif message['role'] == 'assistant' -%}
+        {{- '<start_of_turn>model\n' + (message['content'] | trim) + '<end_of_turn>\n' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<start_of_turn>model\n' -}}
+{%- endif -%}
